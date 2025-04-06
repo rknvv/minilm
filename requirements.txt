@@ -1,0 +1,7 @@
+datasets==3.4.1
+numpy==2.2.4
+sentencepiece==0.2.0
+torch==2.6.0
+tqdm==4.67.1
+transformers==4.49.0
+wandb==0.19.9
