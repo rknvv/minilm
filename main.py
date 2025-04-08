@@ -172,7 +172,7 @@ def parse_args():
         dest="max_seq_len",
     )
 
-    parser.add_argument("--flash_attn", type=str2bool)
+    parser.add_argument("--flash_attn", type=str2bool, dest="flash_attn")
 
     parser.add_argument(
         "--model_dropout",
@@ -304,7 +304,9 @@ def main():
         log.info("Datasets and dataloaders are ready.")
 
     if master_process:
-        log.info(f"Initializing model: MiniLM with vocab_size={model_args.vocab_size}")
+        log.info(
+            f"Initializing model: MiniLM with vocab_size={model_args.vocab_size} and {sum(p.numel() for p in model.parameters())} parameters."
+        )
     model = MiniLM(model_args)
 
     if train_cfg.compile:
@@ -320,9 +322,8 @@ def main():
         eps=1e-8,
     )
 
-    lr_scheduler = None
     if train_cfg.decay_lr:
-        lr_scheduler = get_cosine_schedule_with_warmup(
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=train_cfg.warmup_iters,
             num_training_steps=train_cfg.max_iters,
@@ -333,12 +334,12 @@ def main():
 
     print(train_cfg.device)
     trainer = Trainer(
-        cfg=train_cfg,
-        model_args=model_args,
+        train_cfg=train_cfg,
+        model_cfg=model_args,
         model=model,
         optimizer=optimizer,
         train_loader=train_loader,
-        lr_scheduler=lr_scheduler,
+        scheduler=scheduler,
         eval_loader=eval_loader,
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
