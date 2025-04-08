@@ -5,3 +5,4 @@ torch==2.6.0
 tqdm==4.67.1
 transformers==4.49.0
 wandb==0.19.9
+fire==0.7.0

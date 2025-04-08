@@ -1,7 +1,7 @@
 import os
 import random
-import datetime
-import argparse
+import yaml
+import fire
 import logging
 from dataclasses import asdict
 
@@ -68,191 +68,19 @@ def setup_ddp(cfg: TrainConfig):
     return ddp_rank, ddp_world_size, device, master_process
 
 
-def str2bool(v):
-    if v.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    elif v.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    else:
-        raise argparse.ArgumentTypeError("Boolean value expected.")
+def load_config(path):
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    print(cfg["train"])
+
+    train_cfg = TrainConfig(**cfg["train"])
+    model_args = ModelArgs(**cfg["model"])
+    return train_cfg, model_args
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train MiniLM Model using argparse")
-    parser.add_argument("--out_dir", type=str)
-    parser.add_argument("--dataset_dir", type=str)
-    parser.add_argument("--resume_from_checkpoint", type=str2bool)
-    parser.add_argument("--eval_interval", type=int)
-    parser.add_argument("--log_interval", type=int)
-    parser.add_argument("--eval_iters", type=int)
-
-    parser.add_argument("--always_save_checkpoint", type=str2bool)
-
-    parser.add_argument("--wandb_log", type=str2bool)
-
-    parser.add_argument("--wandb_project", type=str)
-    default_wandb_run_name = f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    parser.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=default_wandb_run_name,
-    )
-
-    parser.add_argument("--gradient_accumulation_steps", type=int)
-    parser.add_argument("--train_batch_size", type=int)
-    parser.add_argument("--eval_batch_size", type=int)
-    parser.add_argument("--context_length", type=int)
-    parser.add_argument("--num_workers", type=int)
-
-    parser.add_argument("--learning_rate", type=float)
-    parser.add_argument("--weight_decay", type=float)
-    parser.add_argument("--beta1", type=float)
-    parser.add_argument("--beta2", type=float)
-    parser.add_argument("--grad_clip", type=float)
-    parser.add_argument("--decay_lr", type=str2bool)
-
-    parser.add_argument("--warmup_iters", type=int)
-    parser.add_argument("--lr_decay_iters", type=int)
-    parser.add_argument("--max_iters", type=int)
-
-    parser.add_argument("--device", type=str)
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        choices=["float32", "bfloat16", "float16"],
-    )
-
-    parser.add_argument("--compile", type=str2bool)
-
-    parser.add_argument("--backend", type=str)
-
-    parser.add_argument("--eval_only", type=str2bool)
-    parser.set_defaults(eval_only=False)
-
-    parser.add_argument("--model_dim", type=int, default=512)
-    parser.add_argument("--model_n_layers", type=int, default=16)
-    parser.add_argument("--model_n_heads", type=int, default=8)
-    parser.add_argument("--model_n_kv_heads", type=int, default=8)
-    parser.add_argument(
-        "--model_vocab_size",
-        type=int,
-        default=8192,
-        dest="vocab_size",
-    )
-    parser.add_argument(
-        "--model_multiple_of",
-        type=int,
-        default=256,
-        dest="multiple_of",
-    )
-
-    parser.add_argument(
-        "--model_ffn_dim_multiplier",
-        type=float,
-        default=None,
-        dest="ffn_dim_multiplier",
-    )
-    parser.add_argument(
-        "--model_norm_eps",
-        type=float,
-        default=1e-5,
-        dest="norm_eps",
-    )
-
-    parser.add_argument(
-        "--model_max_batch_size",
-        type=int,
-        default=32,
-        dest="max_batch_size",
-    )
-    parser.add_argument(
-        "--model_max_seq_len",
-        type=int,
-        default=512,
-        dest="max_seq_len",
-    )
-
-    parser.add_argument("--flash_attn", type=str2bool, dest="flash_attn")
-
-    parser.add_argument(
-        "--model_dropout",
-        type=float,
-        default=0.1,
-        dest="dropout",
-    )
-
-    args = parser.parse_args()
-    return args
-
-
-def main():
-    args = parse_args()
-
-    train_config_arg_names = [
-        "out_dir",
-        "dataset_dir",
-        "resume_from_checkpoint",
-        "eval_interval",
-        "log_interval",
-        "eval_iters",
-        "always_save_checkpoint",
-        "wandb_log",
-        "wandb_project",
-        "wandb_run_name",
-        "gradient_accumulation_steps",
-        "train_batch_size",
-        "eval_batch_size",
-        "context_length",
-        "num_workers",
-        "learning_rate",
-        "max_iters",
-        "weight_decay",
-        "beta1",
-        "beta2",
-        "grad_clip",
-        "decay_lr",
-        "warmup_iters",
-        "lr_decay_iters",
-        "device",
-        "dtype",
-        "compile",
-        "backend",
-        "eval_only",
-    ]
-    model_config_arg_names = [
-        "dim",
-        "n_layers",
-        "n_heads",
-        "n_kv_heads",
-        "vocab_size",
-        "multiple_of",
-        "ffn_dim_multiplier",
-        "norm_eps",
-        "max_batch_size",
-        "max_seq_len",
-        "flash_attn",
-        "dropout",
-    ]
-
-    train_kwargs = {
-        name: getattr(args, name)
-        for name in train_config_arg_names
-        if hasattr(args, name)
-    }
-    model_kwargs = {
-        name: getattr(args, name)
-        for name in model_config_arg_names
-        if hasattr(args, name)
-    }
-
-    train_cfg = TrainConfig(**train_kwargs)
-    model_args = ModelArgs(**model_kwargs)
-    # for field in fields(TrainConfig):
-    #     if hasattr(args, field.name):
-    #         setattr(train_cfg, field.name, getattr(args, field.name))
-    # for field in fields(ModelArgs):
-    #     if hasattr(args, field.name):
-    #         setattr(model_args, field.name, getattr(args, field.name))
+def train_model(yaml_path=None):
+    train_cfg, model_args = load_config(yaml_path)
 
     ddp_rank, ddp_world_size, device, master_process = setup_ddp(train_cfg)
 
@@ -303,16 +131,20 @@ def main():
     if master_process:
         log.info("Datasets and dataloaders are ready.")
 
+    model = MiniLM(model_args)
     if master_process:
         log.info(
             f"Initializing model: MiniLM with vocab_size={model_args.vocab_size} and {sum(p.numel() for p in model.parameters())} parameters."
         )
-    model = MiniLM(model_args)
 
     if train_cfg.compile:
         if master_process:
             log.info("Compiling the model...")
         model = torch.compile(model)
+        dummy_input = torch.randn(1, 1)
+        model(dummy_input)
+        if master_process:
+            log.info("Compiling complete.")
 
     optimizer = AdamW(
         model.parameters(),
@@ -322,6 +154,7 @@ def main():
         eps=1e-8,
     )
 
+    scheduler = None
     if train_cfg.decay_lr:
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
@@ -332,7 +165,6 @@ def main():
     if master_process:
         log.info("Initializing trainer...")
 
-    print(train_cfg.device)
     trainer = Trainer(
         train_cfg=train_cfg,
         model_cfg=model_args,
@@ -352,6 +184,10 @@ def main():
     finally:
         if ddp_world_size > 1:
             dist.destroy_process_group()
+
+
+def main():
+    fire.Fire(train_model)
 
 
 if __name__ == "__main__":
