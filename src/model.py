@@ -112,7 +112,7 @@ class Attention(nn.Module):
 
     def _init_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype):
         cache_shape = (
-            max(self.args.max_batch_size, self.args.max_batch_size),
+            batch_size,
             self.args.max_seq_len,
             self.n_kv_heads,
             self.head_dim,
@@ -120,15 +120,25 @@ class Attention(nn.Module):
 
         if (
             self.k_cache is None
-            # or self.k_cache.shape[0] < batch_size
+            or self.k_cache.shape[0] < batch_size
             or self.k_cache.device != device
             or self.k_cache.dtype != dtype
         ):
-            self.k_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
-            self.v_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
-            logger.debug(
-                f"Initialized KV Cache: Shape={cache_shape}, Device={device}, Dtype={dtype}"
+            new_shape = max(batch_size, self.k_cache.shape[0] if self.k_cache else 0)
+            cache_shape = (
+                new_shape,
+                self.args.max_seq_len,
+                self.n_kv_heads,
+                self.head_dim,
             )
+
+            self.k_cache = torch.empty(
+                cache_shape,
+                device=device,
+                dtype=dtype,
+                pin_memory=device.type == "cuda",
+            )
+            self.v_cache = torch.empty_like(self.k_cache)
 
     def forward(
         self, x: torch.Tensor, start_pos: int, freq_cis: torch.Tensor
@@ -144,7 +154,8 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_emb(xq, xk, freq_cis)
 
         if not self.training:
-            self._init_kv_cache(batch_size, x.device, x.dtype)
+            if self.k_cache is None:
+                self._init_kv_cache(batch_size, x.device, x.dtype)
             assert self.k_cache is not None and self.v_cache is not None
 
             self.k_cache[:batch_size, start_pos : start_pos + seq_len] = xk
@@ -314,10 +325,11 @@ class MiniLM(nn.Module):
         batch_size, prompt_len = prompt_tokens.shape
         max_seq_len = self.args.max_seq_len
 
-        for block in self.layers:
-            block.attention._init_kv_cache(
-                batch_size, device, self.tok_embeddings.weight.dtype
-            )
+        # for block in self.layers:
+        #     if block.attention.k_cache is None:
+        #         block.attention._init_kv_cache(
+        #             batch_size, device, self.tok_embeddings.weight.dtype
+        #         )
 
         logger.info("Processing prompt...")
         _ = self(prompt_tokens, start_pos=0)

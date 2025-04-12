@@ -48,10 +48,22 @@ class Trainer:
 
         if self.ddp_world_size > 1:
             self.model = self.model.to(f"cuda:{self.ddp_rank}")
+            if self.train_cfg.compile:
+                if self.master_process:
+                    logger.info("Compiling the model...")
+                self.model = torch.compile(self.model, mode="max-autotune")
+                if self.master_process:
+                    logger.info("Successfully compiled.")
             self.model = DDP(self.model, device_ids=[self.ddp_rank])
             logger.info(f"Rank [{self.ddp_rank}]: Wrapped model with DDP")
         else:
             self.model = self.model.to(self.device)
+            if self.train_cfg.compile:
+                if self.master_process:
+                    logger.info("Compiling the model...")
+                self.model = torch.compile(self.model, mode="max-autotune")
+                if self.master_process:
+                    logger.info("Successfully compiled.")
 
         self.ptdtype = {
             "float32": torch.float32,
@@ -107,10 +119,8 @@ class Trainer:
             return
 
     def _train_step(self, batch):
-        inputs, targets = batch.values()
-        inputs, targets = inputs.to(self.device, non_blocking=True), targets.to(
-            self.device, non_blocking=True
-        )
+        inputs = batch["input_ids"].to(self.device, non_blocking=True)
+        targets = batch["labels"].to(self.device, non_blocking=True)
 
         with self.ctx:
             _, loss = self.model(inputs, targets=targets)
@@ -265,10 +275,8 @@ class Trainer:
         eval_iterator = iter(self.eval_loader)
         for _ in tqdm(range(self.train_cfg.eval_iters)):
             batch = next(eval_iterator)
-            inputs, targets = batch.values()
-            inputs, targets = inputs.to(self.device, non_blocking=True), targets.to(
-                self.device, non_blocking=True
-            )
+            inputs = batch["input_ids"].to(self.device, non_blocking=True)
+            targets = batch["labels"].to(self.device, non_blocking=True)
 
             with self.ctx:
                 _, loss = self.model(inputs, targets=targets)

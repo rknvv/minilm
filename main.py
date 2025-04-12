@@ -14,7 +14,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.model import MiniLM
 from src.config import ModelArgs, TrainConfig
-from src.dataset import MemMapDatasetForLM
+from src.dataset import MemMapDataset
 from src.trainer import Trainer
 
 
@@ -95,12 +95,12 @@ def train_model(yaml_path=None):
     if master_process:
         log.info("Setting up datasets and dataloaders...")
 
-    train_dataset = MemMapDatasetForLM(
+    train_dataset = MemMapDataset(
         os.path.join(train_cfg.dataset_dir, "train.bin"),
         chunk_size=model_args.max_seq_len,
         memmap_dtype=np.uint16,
     )
-    eval_dataset = MemMapDatasetForLM(
+    eval_dataset = MemMapDataset(
         os.path.join(train_cfg.dataset_dir, "val.bin"),
         chunk_size=model_args.max_seq_len,
         memmap_dtype=np.uint16,
@@ -119,6 +119,7 @@ def train_model(yaml_path=None):
         sampler=train_sampler,
         num_workers=train_cfg.num_workers,
         pin_memory=True if device.startswith("cuda") else False,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -126,6 +127,7 @@ def train_model(yaml_path=None):
         sampler=eval_sampler,
         num_workers=train_cfg.num_workers,
         pin_memory=True if device.startswith("cuda") else False,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
     )
 
     if master_process:
@@ -136,15 +138,6 @@ def train_model(yaml_path=None):
         log.info(
             f"Initializing model: MiniLM with vocab_size={model_args.vocab_size} and {sum(p.numel() for p in model.parameters())} parameters."
         )
-
-    if train_cfg.compile:
-        if master_process:
-            log.info("Compiling the model...")
-        model = torch.compile(model)
-        dummy_input = torch.randn(1, 1)
-        model(dummy_input)
-        if master_process:
-            log.info("Compiling complete.")
 
     optimizer = AdamW(
         model.parameters(),

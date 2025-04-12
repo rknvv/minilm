@@ -23,7 +23,7 @@ class Tokenizer:
         )
         assert self.bpe_model.vocab_size() == self.bpe_model.get_piece_size()
 
-    def encode(self, text: str, bos: bool, eos: bool) -> List[str]:
+    def encode(self, text, bos: bool = False, eos: bool = True) -> List[str]:
         output = self.bpe_model.encode(text)
         if bos:
             output = [self.bos_id] + output

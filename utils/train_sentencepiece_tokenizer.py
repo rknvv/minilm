@@ -2,11 +2,11 @@ import sentencepiece as spm
 import os
 
 options = dict(
-    input="/Users/sandzhar/code/projects/minilm/data/corpus/corpus.txt",
+    input="/Users/sandzhar/code/projects/minilm/data/pretrain/corpus.txt",
     input_format="text",
     model_type="bpe",
-    model_prefix="spm_bpe",
-    vocab_size=8192,
+    model_prefix="bpe_ru_16384_vocab",
+    vocab_size=16384,
     normalization_rule_name="identity",
     remove_extra_whitespaces=False,
     input_sentence_size=1000000,
