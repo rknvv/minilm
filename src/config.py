@@ -7,16 +7,16 @@ import torch
 
 @dataclass
 class ModelArgs:
-    dim: int = 512
-    n_layers: int = 16
-    n_heads: int = 8
-    n_kv_heads: Optional[int] = 8
-    vocab_size: int = 8192
+    dim: int = 768
+    n_layers: int = 12
+    n_heads: int = 12
+    n_kv_heads: Optional[int] = 6
+    vocab_size: int = 16384
     multiple_of: int = 256
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    max_batch_size: int = 32
-    max_seq_len: int = 512
+    max_batch_size: int = 128
+    max_seq_len: int = 1024
     flash_attn: bool = False
     dropout: float = 0.1
 

@@ -9,13 +9,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
 
 from src.model import MiniLM
-from src.config import ModelArgs, TrainConfig
-from src.dataset import MemMapDataset
 from src.trainer import Trainer
+from src.config import ModelArgs, TrainConfig
+
+from src.dataset import MemMapDataset
+from torch.utils.data import DataLoader, DistributedSampler
 
 
 logging.basicConfig(
@@ -65,7 +66,7 @@ def setup_ddp(cfg: TrainConfig):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    return ddp_rank, ddp_world_size, device, master_process
+    return ddp_rank, ddp_world_size, device, master_process, seed
 
 
 def load_config(path):
@@ -82,7 +83,7 @@ def load_config(path):
 def train_model(yaml_path=None):
     train_cfg, model_args = load_config(yaml_path)
 
-    ddp_rank, ddp_world_size, device, master_process = setup_ddp(train_cfg)
+    ddp_rank, ddp_world_size, device, master_process, seed = setup_ddp(train_cfg)
 
     if master_process:
         log.info("--- Training Configuration ---")

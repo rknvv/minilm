@@ -136,7 +136,6 @@ class Attention(nn.Module):
                 cache_shape,
                 device=device,
                 dtype=dtype,
-                pin_memory=device.type == "cuda",
             )
             self.v_cache = torch.empty_like(self.k_cache)
 

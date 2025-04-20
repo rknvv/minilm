@@ -51,7 +51,7 @@ class Trainer:
             if self.train_cfg.compile:
                 if self.master_process:
                     logger.info("Compiling the model...")
-                self.model = torch.compile(self.model, mode="max-autotune")
+                self.model = torch.compile(self.model)
                 if self.master_process:
                     logger.info("Successfully compiled.")
             self.model = DDP(self.model, device_ids=[self.ddp_rank])
@@ -61,7 +61,7 @@ class Trainer:
             if self.train_cfg.compile:
                 if self.master_process:
                     logger.info("Compiling the model...")
-                self.model = torch.compile(self.model, mode="max-autotune")
+                self.model = torch.compile(self.model)
                 if self.master_process:
                     logger.info("Successfully compiled.")
 
@@ -245,8 +245,6 @@ class Trainer:
                                 self.best_eval_loss = eval_loss
                             if self.train_cfg.always_save_checkpoint or is_best:
                                 self.save_checkpoint(is_best=is_best)
-                        if self.ddp_world_size > 1:
-                            dist.barrier()
                         if self.train_cfg.eval_only and self.master_process:
                             return
                 micro_step_count = 0
@@ -291,10 +289,12 @@ class Trainer:
             )
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             global_total_loss = loss_tensor.item()
+            total_eval_iters = self.train_cfg.eval_iters * self.ddp_world_size
         else:
             global_total_loss = total_loss
+            total_eval_iters = self.train_cfg.eval_iters
 
-        avg_loss = global_total_loss / self.train_cfg.eval_iters
+        avg_loss = global_total_loss / total_eval_iters
         perplexity = math.exp(avg_loss)
         if self.master_process:
             logger.info(
