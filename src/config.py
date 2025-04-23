@@ -1,8 +1,5 @@
-import time
 from dataclasses import dataclass
 from typing import Optional
-
-import torch
 
 
 @dataclass
@@ -59,14 +56,3 @@ class TrainConfig:
     backend: str = "nccl"
 
     eval_only: bool = False
-
-    def __post_init__(self):
-        if self.dtype == "bfloat16" and not (
-            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        ):
-            self.dtype = "float16"
-        if self.dtype == "float16" and not torch.cuda.is_available():
-            self.dtype = "float32"
-
-        if self.wandb_run_name == "run":
-            self.wandb_run_name = f"run_{time.strftime('%Y%m%d_%H%M%S')}"

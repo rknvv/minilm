@@ -1,0 +1,44 @@
+train:
+  out_dir: "./out"
+  dataset_dir: "./data"
+  resume_from_checkpoint: false
+  eval_interval: 300
+  log_interval: 20
+  eval_iters: 100
+  always_save_checkpoint: true
+  wandb_log: true
+  wandb_project: "minilm"
+  wandb_run_name: "run_20250413"
+  gradient_accumulation_steps: 16
+  train_batch_size: 128
+  eval_batch_size: 128
+  context_length: 1024
+  num_workers: 16
+  learning_rate: 0.0003
+  max_iters: 8800
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  decay_lr: true
+  warmup_iters: 450
+  lr_decay_iters: 18000
+  device: "cuda"
+  dtype: "bfloat16"
+  compile: true
+  backend: "nccl"
+  eval_only: false
+
+model:
+  dim: 1024
+  n_layers: 24
+  n_heads: 16
+  n_kv_heads: 4
+  vocab_size: 32768
+  multiple_of: 256
+  ffn_dim_multiplier: null
+  norm_eps: 0.00001
+  max_batch_size: 128
+  max_seq_len: 1024
+  flash_attn: true
+  dropout: 0.1

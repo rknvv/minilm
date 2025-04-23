@@ -10,13 +10,12 @@ import torch
 import torch.distributed as dist
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
+from torch.utils.data import DataLoader, DistributedSampler
 
 from src.model import MiniLM
 from src.trainer import Trainer
+from src.dataset import MemmapDataset
 from src.config import ModelArgs, TrainConfig
-
-from src.dataset import MemMapDataset
-from torch.utils.data import DataLoader, DistributedSampler
 
 
 logging.basicConfig(
@@ -96,12 +95,12 @@ def train_model(yaml_path=None):
     if master_process:
         log.info("Setting up datasets and dataloaders...")
 
-    train_dataset = MemMapDataset(
+    train_dataset = MemmapDataset(
         os.path.join(train_cfg.dataset_dir, "train.bin"),
         chunk_size=model_args.max_seq_len,
         memmap_dtype=np.uint16,
     )
-    eval_dataset = MemMapDataset(
+    eval_dataset = MemmapDataset(
         os.path.join(train_cfg.dataset_dir, "val.bin"),
         chunk_size=model_args.max_seq_len,
         memmap_dtype=np.uint16,

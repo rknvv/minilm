@@ -4,11 +4,11 @@ import os
 special_tokens = [f"<r{i}>" for i in range(13)]
 
 options = dict(
-    input="/Volumes/KINGSTON/LLM_300m_prepare/data/corpus_ver_1/corpus.txt",
+    input="/Volumes/KINGSTON/LLM_300m_prepare/data/corpus_ver_2/corpus.txt",
     input_format="text",
     model_type="bpe",
-    model_prefix="bpe_32k",
-    vocab_size=32768,
+    model_prefix="bpe_65k",
+    vocab_size=65536,
     normalization_rule_name="identity",
     remove_extra_whitespaces=False,
     input_sentence_size=1000000,
@@ -35,7 +35,7 @@ options = dict(
     eos_id=2,
     control_symbols=special_tokens,
     num_threads=os.cpu_count(),
-    train_extremely_large_corpus=True,
+    train_extremely_large_corpus=False,
 )
 
 spm.SentencePieceTrainer.train(**options)
