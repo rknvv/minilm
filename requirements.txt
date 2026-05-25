@@ -1,8 +1,19 @@
-datasets==3.4.1
-numpy==2.2.4
-sentencepiece==0.2.0
-torch==2.6.0
-tqdm==4.67.1
-transformers==4.49.0
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch==2.7.0
+triton==3.3.0
+
+numpy==1.26.3
+transformers==5.9.0
+tokenizers==0.22.2
+safetensors==0.7.0
+sentencepiece==0.2.1
+pydantic==2.13.4
+fire==0.7.1
+tqdm==4.67.3
 wandb==0.19.9
-fire==0.7.0
+datasets==3.4.1
+
+liger-kernel==0.8.0
+dion @ git+https://github.com/microsoft/dion.git@2723e9733ceef008d57e938e8d3c9082ffa3f111

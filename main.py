@@ -1,162 +1,90 @@
-import os
-import random
-import yaml
-import fire
+import argparse
 import logging
-from dataclasses import asdict
 
-import numpy as np
-import torch
-import torch.distributed as dist
-from torch.optim import AdamW
-from transformers import get_cosine_schedule_with_warmup
-from torch.utils.data import DataLoader, DistributedSampler
+from config import load_config
+from models.minilm import MiniLM
+from models.lm_head import MiniLMForCausalLM
+from dataio.loaders import build_datasets, build_dataloaders
+from training.distributed import setup_distributed, cleanup_distributed
+from training.optim import build_optimizer, build_scheduler
+from training.checkpoint import load_pretrained_weights
+from training.trainer import Trainer
+from utils.functions import snapshot_run
 
-from src.model import MiniLM
-from src.trainer import Trainer
-from src.dataset import MemmapDataset
-from src.config import ModelArgs, TrainConfig
-
+try:
+    import fire
+except ImportError:
+    fire = None
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 log = logging.getLogger(__name__)
 
-
-def setup_ddp(cfg: TrainConfig):
-    ddp = int(os.environ.get("RANK", -1)) != -1
-    if ddp:
-        assert torch.cuda.is_available()
-        dist.init_process_group(backend=cfg.backend)
-        ddp_rank = int(os.environ["RANK"])
-        ddp_local_rank = int(os.environ["LOCAL_RANK"])
-        ddp_world_size = int(os.environ["WORLD_SIZE"])
-        device = f"cuda:{ddp_local_rank}"
-        torch.cuda.set_device(device)
-        master_process = ddp_rank == 0
-        seed_offset = ddp_rank
-        log.info(f"DDP enabled. Rank {ddp_rank}/{ddp_world_size} on device {device}")
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        master_process = True
-        seed_offset = 0
-        if cfg.device == "cuda" and torch.cuda.is_available():
-            device = "cuda"
-        elif cfg.device == "mps" and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-        log.info(f"DDP not enabled. Running on device {device}")
-
-    cfg.device = device
-    cfg.ddp_rank = ddp_rank
-    cfg.ddp_world_size = ddp_world_size
-    cfg.master_process = master_process
-
-    seed = 42 + seed_offset
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    return ddp_rank, ddp_world_size, device, master_process, seed
+SNAPSHOT_CODE_MODULES = [
+    "models.layers",
+    "models.transformer",
+    "models.minilm",
+    "models.lm_head",
+    "config",
+]
 
 
-def load_config(path):
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
+def train_model(yaml_path: str | None = None) -> None:
+    if yaml_path is None:
+        raise ValueError("yaml_path is required.")
 
-    print(cfg["train"])
-
-    train_cfg = TrainConfig(**cfg["train"])
-    model_args = ModelArgs(**cfg["model"])
-    return train_cfg, model_args
-
-
-def train_model(yaml_path=None):
     train_cfg, model_args = load_config(yaml_path)
+    dist_info = setup_distributed(train_cfg)
 
-    ddp_rank, ddp_world_size, device, master_process, seed = setup_ddp(train_cfg)
+    if dist_info.master:
+        log.info(f"Train config: {train_cfg.model_dump()}")
+        log.info(f"Model args: {model_args.model_dump()}")
+        snapshot_run(
+            out_dir=train_cfg.out_dir,
+            config_sections={
+                "train": train_cfg.model_dump(),
+                "model": model_args.model_dump(),
+            },
+            code_modules=SNAPSHOT_CODE_MODULES,
+        )
 
-    if master_process:
-        log.info("--- Training Configuration ---")
-        log.info(f"Train Config: {asdict(train_cfg)}")
-        log.info("-----------------------------")
-        log.info("---- Model Configuration ----")
-        log.info(f"Model Args: {asdict(model_args)}")
-        log.info("-----------------------------")
-
-    if master_process:
-        log.info("Setting up datasets and dataloaders...")
-
-    train_dataset = MemmapDataset(
-        os.path.join(train_cfg.dataset_dir, "train.bin"),
-        chunk_size=model_args.max_seq_len,
-        memmap_dtype=np.uint16,
-    )
-    eval_dataset = MemmapDataset(
-        os.path.join(train_cfg.dataset_dir, "val.bin"),
-        chunk_size=model_args.max_seq_len,
-        memmap_dtype=np.uint16,
-    )
-
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True
-    )
-    eval_sampler = DistributedSampler(
-        eval_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False
-    )
-
-    train_loader = DataLoader(
+    train_dataset, eval_dataset = build_datasets(train_cfg, model_args)
+    train_loader, eval_loader = build_dataloaders(
+        train_cfg,
         train_dataset,
-        batch_size=train_cfg.train_batch_size,
-        sampler=train_sampler,
-        num_workers=train_cfg.num_workers,
-        pin_memory=True if device.startswith("cuda") else False,
-        persistent_workers=True if train_cfg.num_workers > 0 else False,
-    )
-    eval_loader = DataLoader(
         eval_dataset,
-        batch_size=train_cfg.eval_batch_size,
-        sampler=eval_sampler,
-        num_workers=train_cfg.num_workers,
-        pin_memory=True if device.startswith("cuda") else False,
-        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        world_size=dist_info.world_size,
+        rank=dist_info.rank,
+        device=dist_info.device,
     )
 
-    if master_process:
-        log.info("Datasets and dataloaders are ready.")
+    model = MiniLMForCausalLM(MiniLM(model_args), model_args)
+    if dist_info.master:
+        n_params = sum(p.numel() for p in model.parameters())
+        log.info(f"MiniLMForCausalLM: vocab_size={model_args.vocab_size}, params={n_params:,}")
 
-    model = MiniLM(model_args)
-    if master_process:
-        log.info(
-            f"Initializing model: MiniLM with vocab_size={model_args.vocab_size} and {sum(p.numel() for p in model.parameters())} parameters."
+    if train_cfg.pretrained_checkpoint:
+        if train_cfg.resume_from_checkpoint:
+            log.warning(
+                "Both pretrained_checkpoint and resume_from_checkpoint are set. "
+                "Ignoring pretrained_checkpoint and resuming from out_dir checkpoint."
+            )
+        else:
+            load_pretrained_weights(model, train_cfg.pretrained_checkpoint)
+
+    fsdp_mesh = None
+    if train_cfg.parallel == "fsdp2" and dist_info.world_size > 1:
+        from training.parallel import apply_fsdp2, build_fsdp_mesh
+
+        model = model.to(dist_info.device)
+        fsdp_mesh = build_fsdp_mesh(dist_info.world_size)
+        model = apply_fsdp2(
+            model, train_cfg.dtype, fsdp_mesh, train_cfg.reshard_after_forward
         )
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=train_cfg.learning_rate,
-        weight_decay=train_cfg.weight_decay,
-        betas=(train_cfg.beta1, train_cfg.beta2),
-        eps=1e-8,
-    )
-
-    scheduler = None
-    if train_cfg.decay_lr:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=train_cfg.warmup_iters,
-            num_training_steps=train_cfg.max_iters,
-        )
-
-    if master_process:
-        log.info("Initializing trainer...")
+    optimizer = build_optimizer(model, train_cfg, fsdp_mesh=fsdp_mesh)
+    scheduler = build_scheduler(optimizer, train_cfg)
 
     trainer = Trainer(
         train_cfg=train_cfg,
@@ -166,21 +94,28 @@ def train_model(yaml_path=None):
         train_loader=train_loader,
         scheduler=scheduler,
         eval_loader=eval_loader,
-        ddp_rank=ddp_rank,
-        ddp_world_size=ddp_world_size,
-        master_process=master_process,
-        resume_from_checkpoint=train_cfg.resume_from_checkpoint,
+        ddp_rank=dist_info.rank,
+        ddp_local_rank=dist_info.local_rank,
+        ddp_world_size=dist_info.world_size,
+        master_process=dist_info.master,
     )
 
     try:
         trainer.train()
     finally:
-        if ddp_world_size > 1:
-            dist.destroy_process_group()
+        trainer.cleanup()
+        cleanup_distributed(dist_info)
 
 
-def main():
-    fire.Fire(train_model)
+def main() -> None:
+    if fire is not None:
+        fire.Fire(train_model)
+        return
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--yaml_path", required=True, type=str)
+    args = parser.parse_args()
+    train_model(yaml_path=args.yaml_path)
 
 
 if __name__ == "__main__":

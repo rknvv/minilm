@@ -14,4 +14,4 @@ torchrun \
   --master_addr=$MASTER_ADDR \
   --master_port=$MASTER_PORT \
   main.py \
-  --yaml_path="./configs/train_59m.yaml"
+  --yaml_path="./configs/train_91m.yaml"

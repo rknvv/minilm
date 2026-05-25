@@ -1,0 +1,52 @@
+train:
+  task: "sft"
+  out_dir: "./out_sft_250m_1e-5"
+  train_data_path: "/workspace/data/train.jsonl"
+  eval_data_path: "/workspace/data/val.jsonl"
+  tokenizer_path: "/workspace/data/bpe_32k.model"
+  pretrained_checkpoint: "/workspace/data/pretrain.pt"
+
+  sft_ignore_idx: -100
+  resume_from_checkpoint: false
+  resume_checkpoint_kind: "latest"
+
+  eval_interval: 25
+  log_interval: 10
+  eval_iters: 100
+  always_save_checkpoint: true
+
+  wandb_log: true
+  wandb_project: "minilm-sft-250m"
+  wandb_run_name: "sft_250m"
+
+  gradient_accumulation_steps: 4
+  train_batch_size: 24
+  eval_batch_size: 24
+  num_workers: 8
+  learning_rate: 0.00001
+  max_iters: 160
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+
+  decay_lr: true
+  warmup_iters: 10
+
+  device: "cuda"
+  dtype: "bfloat16"
+  compile: true
+  backend: "nccl"
+  eval_only: false
+
+model:
+  dim: 1024
+  n_layers: 18
+  n_heads: 16
+  n_kv_heads: 4
+  vocab_size: 32768
+  multiple_of: 256
+  ffn_dim_multiplier: 1.125
+  norm_eps: 0.00001
+  max_seq_len: 768
+  dropout: 0.05
