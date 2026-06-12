@@ -1,0 +1,72 @@
+# Profiling / smoke config: single A100, short run, real CPT shapes.
+# Run:  python main.py --yaml_path=configs/profile_a100_1gpu.yaml
+# Data: ./data/profile (60k fineweb2-ru docs, ~100M tokens, v2 tokenizer, uint32).
+# Steady-state numbers come from the logs at iters 10..60 (step 1 with compile
+# is excluded from throughput counters automatically).
+# If OOM (A100-40GB): set gradient_checkpointing: true, or batch 4 + accum 8.
+train:
+  task: "pretrain"
+  out_dir: "./out_profile"
+  dataset_dir: "./data/profile"
+  token_dtype: "auto"
+
+  pretrained_checkpoint: "./external/gemma3-1b-base/gemma-3-1b-pt-ruen-v2/model.safetensors"
+  resume_from_checkpoint: false
+  seed: 42
+
+  eval_interval: 50
+  log_interval: 10
+  eval_iters: 50
+  always_save_checkpoint: true
+
+  wandb_log: false
+  wandb_project: "gemma3_1b_cpt_ruen"
+  wandb_run_name: "profile_a100"
+
+  gradient_accumulation_steps: 4
+  train_batch_size: 8
+  eval_batch_size: 8
+  num_workers: 8
+
+  learning_rate: 0.00005
+  muon_lr: 0.0005
+  max_iters: 60
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+
+  decay_lr: true
+  warmup_iters: 10
+  min_lr_ratio: 0.1
+
+  device: "cuda"
+  dtype: "bfloat16"
+  compile: true
+  backend: "nccl"
+  # Chrome trace of optimizer steps 11-13 -> ./out_profile/trace_*.json
+  # (open in chrome://tracing or https://ui.perfetto.dev)
+  profile: true
+  eval_only: false
+
+model:
+  dim: 1152
+  n_layers: 26
+  n_heads: 4
+  n_kv_heads: 1
+  head_dim: 256
+  vocab_size: 153856
+  intermediate_size: 6912
+  norm_eps: 0.000001
+  max_seq_len: 2048
+  dropout: 0.0
+
+  query_pre_attn_scalar: 256.0
+  rope_theta: 1000000.0
+  rope_local_base_freq: 10000.0
+  sliding_window: 512
+  sliding_window_pattern: 6
+
+  gradient_checkpointing: false
+  ce_chunk_size: 2048
+  use_liger: true

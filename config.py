@@ -7,16 +7,24 @@ class ModelArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dim: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    n_kv_heads: Optional[int] = 6
-    vocab_size: int = 16384
-    multiple_of: int = 256
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
-    max_seq_len: int = 1024
-    dropout: float = 0.1
+    # Gemma-3-1B defaults
+    dim: int = 1152
+    n_layers: int = 26
+    n_heads: int = 4
+    n_kv_heads: Optional[int] = 1
+    head_dim: int = 256
+    vocab_size: int = 183927
+    intermediate_size: int = 6912
+    norm_eps: float = 1e-6
+    max_seq_len: int = 2048
+    dropout: float = 0.0
+
+    # Gemma-3 attention specifics
+    query_pre_attn_scalar: float = 256.0
+    rope_theta: float = 1_000_000.0
+    rope_local_base_freq: float = 10_000.0
+    sliding_window: int = 512
+    sliding_window_pattern: int = 6
 
     gradient_checkpointing: bool = False
 
@@ -26,16 +34,39 @@ class ModelArgs(BaseModel):
 
     @model_validator(mode="after")
     def _check_shapes(self) -> "ModelArgs":
-        if self.dim % self.n_heads != 0:
-            raise ValueError(f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})")
         if self.n_kv_heads is not None and self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
             )
-
-        if self.vocab_size > 65535:
-            raise ValueError(f"vocab_size ({self.vocab_size}) must fit uint16 (<= 65535)")
         return self
+
+    @classmethod
+    def from_hf(cls, hf_config: dict, **overrides) -> "ModelArgs":
+        """Build ModelArgs from a HF Gemma3 config.json dict.
+
+        Architecture fields come from the HF config; training-only fields
+        (max_seq_len, dropout, gradient_checkpointing, ce_chunk_size, use_liger)
+        keep their defaults unless passed via overrides. Note: HF
+        max_position_embeddings (32768) is NOT used for max_seq_len — set it
+        explicitly via overrides to bound RoPE/KV-cache/mask memory.
+        """
+        args = dict(
+            dim=hf_config["hidden_size"],
+            n_layers=hf_config["num_hidden_layers"],
+            n_heads=hf_config["num_attention_heads"],
+            n_kv_heads=hf_config["num_key_value_heads"],
+            head_dim=hf_config["head_dim"],
+            vocab_size=hf_config["vocab_size"],
+            intermediate_size=hf_config["intermediate_size"],
+            norm_eps=hf_config["rms_norm_eps"],
+            query_pre_attn_scalar=hf_config["query_pre_attn_scalar"],
+            rope_theta=hf_config["rope_theta"],
+            rope_local_base_freq=hf_config["rope_local_base_freq"],
+            sliding_window=hf_config["sliding_window"],
+            sliding_window_pattern=hf_config["sliding_window_pattern"],
+        )
+        args.update(overrides)
+        return cls(**args)
 
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -53,6 +84,11 @@ class TrainConfig(BaseModel):
     resume_from_checkpoint: bool = True
     resume_checkpoint_kind: Literal["latest", "best", "auto"] = "latest"
 
+    seed: int = 42
+    # Storage dtype of train.bin/val.bin token ids. "auto" resolves from
+    # meta.json written by preprocess_text.py, else from vocab_size.
+    token_dtype: Literal["auto", "uint16", "uint32"] = "auto"
+
     eval_interval: int = Field(default=10, ge=1)
     log_interval: int = Field(default=1, ge=1)
     eval_iters: int = Field(default=1, ge=1)
@@ -67,7 +103,10 @@ class TrainConfig(BaseModel):
 
     num_workers: int = Field(default=4, ge=0)
 
+    # AdamW lr (embeddings/head/scalars). Muon hidden matrices use muon_lr,
+    # conventionally ~10-20x higher; falls back to learning_rate if unset.
     learning_rate: float = 6e-4
+    muon_lr: Optional[float] = None
     max_iters: int = Field(default=600000, ge=1)
     weight_decay: float = 1e-1
     beta1: float = 0.9
@@ -75,14 +114,18 @@ class TrainConfig(BaseModel):
     grad_clip: float = 1.0
     decay_lr: bool = True
     warmup_iters: int = Field(default=2000, ge=0)
+    # Cosine decays to min_lr_ratio * peak instead of 0.
+    min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
 
     device: str = "cuda"
     dtype: Literal["float32", "float16", "bfloat16"] = "bfloat16"
     compile: bool = False
     backend: str = "nccl"
 
-    parallel: Literal["ddp", "fsdp2"] = "ddp"
-    reshard_after_forward: bool = False
+    # torch.profiler: skips 8 steps (compile warmup), warms 2, traces 3 full
+    # optimizer steps; chrome trace + op table land in out_dir.
+    profile: bool = False
+
     ema: Optional[float] = None
 
     eval_only: bool = False
@@ -97,6 +140,8 @@ class TrainConfig(BaseModel):
             raise ValueError("task='sft' requires train_data_path")
         if self.ema is not None and not (0.0 < self.ema < 1.0):
             raise ValueError(f"ema decay must be in (0, 1), got {self.ema}")
+        if self.muon_lr is not None and self.muon_lr <= 0:
+            raise ValueError(f"muon_lr must be > 0, got {self.muon_lr}")
         return self
 
 

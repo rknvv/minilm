@@ -1,8 +1,8 @@
 import logging
+import math
 from typing import Optional
 
 import torch
-from transformers import get_cosine_schedule_with_warmup
 
 from config import TrainConfig
 
@@ -14,7 +14,6 @@ MUON_MOMENTUM = 0.95
 def build_optimizer(
     model: torch.nn.Module,
     train_cfg: TrainConfig,
-    fsdp_mesh=None,
 ) -> torch.optim.Optimizer:
     from dion import Muon
 
@@ -43,28 +42,48 @@ def build_optimizer(
             )
             seen_ids[id(p)] = group_name
 
+    adamw_lr = train_cfg.learning_rate
+    if train_cfg.muon_lr is not None:
+        muon_lr = train_cfg.muon_lr
+    else:
+        muon_lr = adamw_lr
+        logger.warning(
+            "muon_lr is not set; Muon group falls back to learning_rate=%.2e. "
+            "Muon typically wants ~10-20x the AdamW lr.",
+            adamw_lr,
+        )
+
     param_groups = [
-        dict(params=hidden_matrix_params, algorithm="muon"),
-        dict(params=embed_and_head_params, algorithm="adamw"),
-        dict(params=scalar_params, algorithm="adamw"),
+        dict(params=hidden_matrix_params, algorithm="muon", lr=muon_lr),
+        dict(params=embed_and_head_params, algorithm="adamw", lr=adamw_lr),
+        dict(params=scalar_params, algorithm="adamw", lr=adamw_lr),
     ]
     return Muon(
         param_groups,
-        lr=train_cfg.learning_rate,
+        lr=adamw_lr,
         mu=MUON_MOMENTUM,
         betas=(train_cfg.beta1, train_cfg.beta2),
         weight_decay=train_cfg.weight_decay,
-        distributed_mesh=fsdp_mesh,
     )
 
 
 def build_scheduler(
     optimizer: torch.optim.Optimizer, train_cfg: TrainConfig
-) -> Optional[object]:
+) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
+    """Linear warmup, then cosine decay to min_lr_ratio * peak (not to 0)."""
     if not train_cfg.decay_lr:
         return None
-    return get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=train_cfg.warmup_iters,
-        num_training_steps=train_cfg.max_iters,
-    )
+
+    warmup = train_cfg.warmup_iters
+    total = train_cfg.max_iters
+    floor = train_cfg.min_lr_ratio
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / max(1, warmup)
+        progress = (step - warmup) / max(1, total - warmup)
+        progress = min(1.0, progress)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return floor + (1.0 - floor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

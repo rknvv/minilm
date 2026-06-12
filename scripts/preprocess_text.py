@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from typing import Any
@@ -14,13 +15,50 @@ if PROJECT_ROOT not in sys.path:
 from dataio.tokenizer import Tokenizer
 
 
+class HFTokenizer:
+    """Minimal adapter for HF tokenizers."""
+
+    def __init__(self, path: str) -> None:
+        from tokenizers import Tokenizer as TokenizersTokenizer
+
+        self._tk = TokenizersTokenizer.from_file(path)
+        self.vocab_size = self._tk.get_vocab_size()
+        bos = self._tk.token_to_id("<bos>")
+        eos = self._tk.token_to_id("<eos>")
+        self.bos_id = -1 if bos is None else bos
+        self.eos_id = -1 if eos is None else eos
+
+    def __call__(
+        self,
+        text: str,
+        bos: bool,
+        eos: bool,
+        return_tensors: str = "np",
+        dtype=None,
+    ) -> np.ndarray:
+        ids = self._tk.encode(text, add_special_tokens=False).ids
+        if bos:
+            ids = [self.bos_id] + ids
+        if eos:
+            ids = ids + [self.eos_id]
+        return np.asarray(ids, dtype=dtype if dtype is not None else np.int64)
+
+
+def load_tokenizer(path: str):
+    if path.endswith(".json"):
+        return HFTokenizer(path)
+    return Tokenizer(model_file=path)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tokenize text corpus into train/val .bin files.")
+    parser = argparse.ArgumentParser(
+        description="Tokenize text corpus into train/val .bin files."
+    )
     parser.add_argument(
         "--tokenizer_path",
         required=True,
         type=str,
-        help="Path to SentencePiece model.",
+        help="Path to a SentencePiece model or HF tokenizer.json.",
     )
     parser.add_argument(
         "--dataset_files",
@@ -51,28 +89,76 @@ def parse_args() -> argparse.Namespace:
         default=10_000,
         help="Modulo buckets for deterministic train/val split.",
     )
+    parser.add_argument(
+        "--token_dtype",
+        choices=["auto", "uint16", "uint32"],
+        default="auto",
+        help="Storage dtype for token ids; auto picks by tokenizer vocab size.",
+    )
+    parser.add_argument(
+        "--add_bos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prepend BOS to each document (Gemma pretraining framing).",
+    )
+    parser.add_argument(
+        "--add_eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append EOS to each document.",
+    )
     args = parser.parse_args()
     if not args.dataset_files and not args.dataset_dir:
         parser.error("one of --dataset_files or --dataset_dir is required")
     return args
 
 
+def _split_bucket(i: int, buckets: int) -> int:
+    """splitmix64-style mix: deterministic pseudo-random train/val bucketing.
+
+    A plain `i % buckets` would put a contiguous run of documents from the
+    start of every block into val, biasing it toward corpus ordering.
+    """
+    z = (i + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (z ^ (z >> 31)) % buckets
+
+
+def resolve_token_dtype(token_dtype: str, vocab_size: int) -> np.dtype:
+    max_id = vocab_size - 1
+    if token_dtype == "auto":
+        return np.dtype(np.uint16 if max_id <= np.iinfo(np.uint16).max else np.uint32)
+    dtype = np.dtype(token_dtype)
+    if max_id > np.iinfo(dtype).max:
+        raise ValueError(
+            f"Tokenizer vocab_size={vocab_size} does not fit {dtype.name}; "
+            "use --token_dtype auto or uint32."
+        )
+    return dtype
+
+
 def tokenize_corpus(
-    tokenizer: Tokenizer,
+    tokenizer: Tokenizer | HFTokenizer,
     dataset_files: list[str],
     output_path: str,
     val_ratio: float,
     split_buckets: int,
+    token_dtype: str = "auto",
+    add_bos: bool = True,
+    add_eos: bool = True,
 ) -> None:
     if not (0.0 <= val_ratio < 1.0):
         raise ValueError("--val_ratio must be in [0, 1).")
     if split_buckets <= 0:
         raise ValueError("--split_buckets must be > 0.")
-    if tokenizer.vocab_size > np.iinfo(np.uint16).max:
-        raise ValueError(
-            f"Tokenizer vocab_size={tokenizer.vocab_size} does not fit uint16. "
-            "Increase storage dtype and align trainer memmap dtype."
-        )
+    dtype = resolve_token_dtype(token_dtype, tokenizer.vocab_size)
+    if add_bos and tokenizer.bos_id < 0:
+        raise ValueError("--add_bos requested but the tokenizer has no BOS id.")
+    print(
+        f"Token dtype: {dtype.name} (vocab_size={tokenizer.vocab_size}), "
+        f"add_bos={add_bos}, add_eos={add_eos}"
+    )
 
     data_files: str | list[str]
     if len(dataset_files) == 1:
@@ -85,14 +171,14 @@ def tokenize_corpus(
     def tokenize(item: dict[str, Any]) -> dict[str, np.ndarray]:
         token_ids = tokenizer(
             item["text"],
-            bos=False,
-            eos=True,
+            bos=add_bos,
+            eos=add_eos,
             return_tensors="np",
-            dtype=np.uint16,
+            dtype=dtype,
         )
         if isinstance(token_ids, np.ndarray):
             return {"ids": token_ids.reshape(-1)}
-        return {"ids": np.asarray(token_ids, dtype=np.uint16)}
+        return {"ids": np.asarray(token_ids, dtype=dtype)}
 
     tokenized_data = dataset.map(tokenize, remove_columns="text")
 
@@ -108,11 +194,11 @@ def tokenize_corpus(
         for i, item in enumerate(tqdm(tokenized_data["train"], desc="Processing data")):
             token_ids = item["ids"]
             if not isinstance(token_ids, np.ndarray):
-                token_ids = np.asarray(token_ids, dtype=np.uint16)
+                token_ids = np.asarray(token_ids, dtype=dtype)
             else:
-                token_ids = token_ids.astype(np.uint16, copy=False)
+                token_ids = token_ids.astype(dtype, copy=False)
 
-            is_val = (i % split_buckets) < val_threshold
+            is_val = _split_bucket(i, split_buckets) < val_threshold
             if is_val:
                 token_ids.tofile(val_f)
                 val_docs += 1
@@ -122,15 +208,28 @@ def tokenize_corpus(
                 train_docs += 1
                 train_tokens += int(token_ids.size)
 
+    meta = {
+        "token_dtype": dtype.name,
+        "vocab_size": int(tokenizer.vocab_size),
+        "add_bos": add_bos,
+        "add_eos": add_eos,
+        "train_tokens": train_tokens,
+        "val_tokens": val_tokens,
+    }
+    meta_filename = os.path.join(output_path, "meta.json")
+    with open(meta_filename, "w") as f:
+        json.dump(meta, f, indent=2)
+
     print(
         f"Done. Train: {train_docs} docs / {train_tokens} tokens -> {train_filename}; "
-        f"Val: {val_docs} docs / {val_tokens} tokens -> {val_filename}"
+        f"Val: {val_docs} docs / {val_tokens} tokens -> {val_filename}; "
+        f"meta -> {meta_filename}"
     )
 
 
 def main() -> None:
     args = parse_args()
-    tokenizer = Tokenizer(model_file=args.tokenizer_path)
+    tokenizer = load_tokenizer(args.tokenizer_path)
     dataset_files = args.dataset_files or args.dataset_dir
     tokenize_corpus(
         tokenizer=tokenizer,
@@ -138,6 +237,9 @@ def main() -> None:
         output_path=args.output_path,
         val_ratio=args.val_ratio,
         split_buckets=args.split_buckets,
+        token_dtype=args.token_dtype,
+        add_bos=args.add_bos,
+        add_eos=args.add_eos,
     )
 
 

@@ -3,6 +3,8 @@
 import math
 import logging
 import os
+import shutil
+import time
 from contextlib import nullcontext
 from typing import Any, Iterator, Optional, cast
 
@@ -17,6 +19,16 @@ from training.ema import EMA
 from config import TrainConfig, ModelArgs
 
 logger = logging.getLogger(__name__)
+
+# Dense bf16/fp16 peak TFLOPs (no sparsity) for MFU estimation.
+_GPU_PEAK_FLOPS = {
+    "H200": 989e12,
+    "H100": 989e12,
+    "A100": 312e12,
+    "L40S": 362e12,
+    "RTX 4090": 165e12,
+    "RTX 3090": 71e12,
+}
 
 
 class Trainer:
@@ -57,54 +69,34 @@ class Trainer:
             "bfloat16": torch.bfloat16,
         }.get(train_cfg.dtype, torch.float16)
 
-        self.use_fsdp2 = self.train_cfg.parallel == "fsdp2" and self.ddp_world_size > 1
-
         if self.ddp_world_size > 1:
-            local_device = f"cuda:{self.ddp_local_rank}"
-            self.device = local_device
+            self.device = f"cuda:{self.ddp_local_rank}"
             torch.cuda.set_device(self.ddp_local_rank)
-            if self.use_fsdp2:
+            self.model = self.model.to(self.device)
+            # DDP first, compile second: lets DDPOptimizer split the graph at
+            # bucket boundaries so allreduce overlaps with compiled backward.
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                output_device=self.ddp_local_rank,
+                gradient_as_bucket_view=True,
+            )
+            logger.info(
+                f"Rank [{self.ddp_rank}] local rank [{self.ddp_local_rank}]: Wrapped model with DDP"
+            )
+            if self.train_cfg.compile:
+                self.model = cast(torch.nn.Module, torch.compile(self.model))
                 if self.master_process:
-                    logger.info("Using FSDP2-wrapped model.")
-                if self.train_cfg.compile:
-                    self.model = cast(torch.nn.Module, torch.compile(self.model))
-                    if self.master_process:
-                        logger.info("Compiled FSDP2 model.")
-            else:
-                self.model = self.model.to(local_device)
-                if self.train_cfg.compile:
-                    if self.master_process:
-                        logger.info("Compiling the model...")
-                    self.model = cast(torch.nn.Module, torch.compile(self.model))
-                    if self.master_process:
-                        logger.info("Successfully compiled.")
-                self.model = DDP(
-                    self.model,
-                    device_ids=[self.ddp_local_rank],
-                    output_device=self.ddp_local_rank,
-                )
-                logger.info(
-                    f"Rank [{self.ddp_rank}] local rank [{self.ddp_local_rank}]: Wrapped model with DDP"
-                )
+                    logger.info("Compiled DDP-wrapped model.")
         else:
             self.model = self.model.to(self.device)
             if self.train_cfg.compile:
+                self.model = cast(torch.nn.Module, torch.compile(self.model))
                 if self.master_process:
-                    logger.info("Compiling the model...")
-                compiled_model = torch.compile(self.model)
-                if isinstance(compiled_model, torch.nn.Module):
-                    self.model = compiled_model
-                elif self.master_process:
-                    logger.warning(
-                        "Compiled model is not nn.Module, using eager module."
-                    )
-                if self.master_process:
-                    logger.info("Successfully compiled.")
+                    logger.info("Compiled model.")
 
         autocast_device_type = "cuda" if self.device.startswith("cuda") else self.device
-        if self.use_fsdp2 or (
-            self.ptdtype != torch.float32 and autocast_device_type == "cpu"
-        ):
+        if self.ptdtype == torch.float32 or autocast_device_type == "cpu":
             self.ctx = nullcontext()
         else:
             self.ctx = torch.autocast(
@@ -116,7 +108,6 @@ class Trainer:
             enabled=(
                 self.train_cfg.dtype == "float16"
                 and autocast_device_type == "cuda"
-                and not self.use_fsdp2
             ),
         )
 
@@ -124,29 +115,34 @@ class Trainer:
         os.makedirs(self.out_dir, exist_ok=True)
         self.checkpoint_path = os.path.join(self.out_dir, "ckpt.pt")
         self.best_checkpoint_path = os.path.join(self.out_dir, "ckpt_best.pt")
-        self.dist_checkpoint_path = os.path.join(self.out_dir, "ckpt_dist")
-        self.dist_best_path = os.path.join(self.out_dir, "ckpt_best_dist")
 
         self.global_step = 0
         self.tokens_seen = 0
         self.best_eval_loss = float("inf")
-        self.running_loss = 0.0
 
         self.train_epoch = 0
+        self.samples_in_epoch = 0  # per-rank samples consumed in current epoch
         self.eval_epoch = 0
         self.train_iter: Optional[Iterator[dict[str, torch.Tensor]]] = None
         self.eval_iter: Optional[Iterator[dict[str, torch.Tensor]]] = None
+
+        self.flops_per_token = self._estimate_flops_per_token()
+        self.peak_flops = self._detect_peak_flops()
 
         self.ema: Optional[EMA] = None
         if self.train_cfg.ema is not None:
             self.ema = EMA(self._get_model_module(), self.train_cfg.ema)
 
+        self._wandb_resume_id: Optional[str] = None
         if self.train_cfg.resume_from_checkpoint:
             self.load_checkpoint()
 
         self.wandb_run = None
         if self.train_cfg.wandb_log and self.master_process:
             self._init_wandb()
+
+        if self.master_process:
+            self._log_loss_path()
 
     def _init_wandb(self) -> None:
         try:
@@ -162,11 +158,107 @@ class Trainer:
                 name=self.train_cfg.wandb_run_name,
                 config=config_dict,
                 resume="allow",
-                id=(wandb.util.generate_id() if self.global_step == 0 else None),
+                id=(self._wandb_resume_id or wandb.util.generate_id()),
             )
         except ImportError:
             logger.warning("WandB is not installed. Skipping...")
             self.train_cfg.wandb_log = False
+
+    def _log_loss_path(self) -> None:
+        from models.layers import HAS_LIGER
+
+        args = self.model_cfg
+        on_cuda = self.device.startswith("cuda")
+        if args.use_liger and HAS_LIGER and on_cuda:
+            path = "liger fused linear cross-entropy"
+        elif args.ce_chunk_size and args.ce_chunk_size > 0:
+            path = f"chunked cross-entropy (chunk={args.ce_chunk_size})"
+            if args.use_liger and not HAS_LIGER:
+                logger.warning(
+                    "use_liger=True but liger-kernel is not installed; "
+                    "falling back to chunked CE."
+                )
+        else:
+            path = "full-logits cross-entropy"
+        logger.info(f"Loss path: {path}")
+
+    def _estimate_flops_per_token(self) -> float:
+        """Model FLOPs per token (fwd+bwd), causal attention accounted."""
+        m = self.model_cfg
+        d, L, H = m.dim, m.n_layers, m.n_heads
+        hd = m.head_dim
+        kv_heads = m.n_kv_heads if m.n_kv_heads is not None else H
+        T = m.max_seq_len
+        w = m.sliding_window
+
+        attn_params = d * H * hd + 2 * d * kv_heads * hd + H * hd * d
+        mlp_params = 3 * d * m.intermediate_size
+        head_params = d * m.vocab_size  # tied head matmul still costs FLOPs
+
+        def avg_kv_len(window: Optional[int]) -> float:
+            if window is None or window >= T:
+                return (T + 1) / 2
+            return (window * (window + 1) / 2 + (T - window) * window) / T
+
+        n_global = sum(
+            1 for i in range(L) if (i + 1) % m.sliding_window_pattern == 0
+        )
+        n_local = L - n_global
+        attn_fwd = (
+            4 * H * hd * (n_global * avg_kv_len(None) + n_local * avg_kv_len(w))
+        )
+
+        fwd = 2 * (L * (attn_params + mlp_params) + head_params) + attn_fwd
+        return 3.0 * fwd  # backward ~= 2x forward
+
+    def _detect_peak_flops(self) -> Optional[float]:
+        if not self.device.startswith("cuda") or not torch.cuda.is_available():
+            return None
+        name = torch.cuda.get_device_name(torch.cuda.current_device())
+        for key, val in _GPU_PEAK_FLOPS.items():
+            if key in name:
+                return val
+        logger.warning(f"Unknown GPU '{name}' for MFU estimation.")
+        return None
+
+    def _build_profiler(self):
+        """torch.profiler armed at optimizer-step granularity (see TrainConfig.profile)."""
+        if not self.train_cfg.profile:
+            return None
+        from torch.profiler import ProfilerActivity, profile, schedule
+
+        cuda = self.device.startswith("cuda")
+        activities = [ProfilerActivity.CPU] + (
+            [ProfilerActivity.CUDA] if cuda else []
+        )
+        sort_key = "self_cuda_time_total" if cuda else "self_cpu_time_total"
+
+        def on_trace_ready(prof) -> None:
+            path = os.path.join(
+                self.out_dir,
+                f"trace_step{self.global_step}_rank{self.ddp_rank}.json",
+            )
+            prof.export_chrome_trace(path)
+            logger.info(f"Profiler trace saved to {path}")
+            if self.master_process:
+                logger.info(
+                    "\n" + prof.key_averages().table(sort_by=sort_key, row_limit=25)
+                )
+
+        prof = profile(
+            activities=activities,
+            # wait covers compile/autotune steps; active=3 captures 3 full
+            # optimizer steps (incl. all grad-accum microsteps).
+            schedule=schedule(wait=8, warmup=2, active=3, repeat=1),
+            on_trace_ready=on_trace_ready,
+        )
+        prof.start()
+        if self.master_process:
+            logger.info(
+                "Profiler armed: trace covers optimizer steps 11-13 "
+                "(needs max_iters >= 13)."
+            )
+        return prof
 
     def _train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         inputs = batch["input_ids"].to(self.device, non_blocking=True)
@@ -190,20 +282,38 @@ class Trainer:
         self.scaler.scale(loss).backward()
         return loss
 
+    def _ddp_module(self) -> Optional[DDP]:
+        m = self.model
+        while True:
+            if isinstance(m, DDP):
+                return m
+            if hasattr(m, "_orig_mod"):
+                m = m._orig_mod
+            else:
+                return None
+
+    def _get_model_module(self) -> torch.nn.Module:
+        m = self.model
+        while True:
+            if hasattr(m, "_orig_mod"):
+                m = m._orig_mod
+            elif isinstance(m, DDP):
+                m = m.module
+            else:
+                return m
+
     def _grad_sync_context(self, is_sync_step: bool):
-        if self.ddp_world_size <= 1:
-            return nullcontext()
-        if self.use_fsdp2:
-            getattr(self.model, "set_requires_gradient_sync")(is_sync_step)
-            return nullcontext()
-        if isinstance(self.model, DDP) and not is_sync_step:
-            return self.model.no_sync()
+        ddp = self._ddp_module()
+        if ddp is not None and not is_sync_step:
+            return ddp.no_sync()
         return nullcontext()
 
     def _reset_train_iterator(self) -> None:
         sampler = self.train_loader.sampler
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(self.train_epoch)
+        if hasattr(sampler, "skip_samples"):
+            sampler.skip_samples = self.samples_in_epoch
         self.train_iter = iter(self.train_loader)
 
     def _next_train_batch(self) -> dict[str, torch.Tensor]:
@@ -211,12 +321,15 @@ class Trainer:
             self._reset_train_iterator()
         assert self.train_iter is not None
         try:
-            return next(self.train_iter)
+            batch = next(self.train_iter)
         except StopIteration:
             self.train_epoch += 1
+            self.samples_in_epoch = 0
             self._reset_train_iterator()
             assert self.train_iter is not None
-            return next(self.train_iter)
+            batch = next(self.train_iter)
+        self.samples_in_epoch += self.train_cfg.train_batch_size
+        return batch
 
     def _reset_eval_iterator(self) -> None:
         if self.eval_loader is None:
@@ -228,18 +341,23 @@ class Trainer:
         self.eval_iter = iter(self.eval_loader)
 
     def _next_eval_batch(self) -> dict[str, torch.Tensor]:
-        if self.eval_iter is None:
-            self._reset_eval_iterator()
         assert self.eval_iter is not None
         try:
             return next(self.eval_iter)
         except StopIteration:
-            self.eval_epoch += 1
             self._reset_eval_iterator()
             assert self.eval_iter is not None
             return next(self.eval_iter)
 
     def train(self) -> None:
+        if self.train_cfg.eval_only:
+            if self.ddp_world_size > 1:
+                dist.barrier()
+            eval_loss = self.evaluate()
+            if self.master_process:
+                logger.info(f"eval_only: Eval loss: {eval_loss}")
+            return
+
         if self.master_process:
             logger.info(
                 f"Starting training process from global step/max iterations: [{self.global_step}/{self.train_cfg.max_iters}]"
@@ -249,31 +367,40 @@ class Trainer:
                 * self.train_cfg.gradient_accumulation_steps
                 * self.ddp_world_size
             )
-            logger.info(f"Effective batch size: {effective_batch_size}")
+            logger.info(
+                f"Effective batch size: {effective_batch_size} "
+                f"({effective_batch_size * self.model_cfg.max_seq_len:,} tokens/step)"
+            )
 
         if self.ddp_world_size > 1:
             dist.barrier()
 
         self.model.train()
-        self.running_loss = 0.0
         micro_step_count = 0
+        profiler = self._build_profiler()
+
+        # GPU-side accumulators: no .item()/allreduce until log_interval.
+        loss_since_log = torch.zeros((), device=self.device)
+        steps_since_log = 0
+        tokens_since_log = 0
+        cuda = self.device.startswith("cuda")
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
+        t_log = time.perf_counter()
 
         while self.global_step < self.train_cfg.max_iters:
-            try:
-                train_batch = self._next_train_batch()
-            except Exception as e:
-                logger.error(f"Error: {e}.")
-                if self.ddp_world_size > 1:
-                    dist.barrier()
-                break
+            train_batch = self._next_train_batch()
 
             if self.train_cfg.task == "sft":
-                non_pad = (train_batch["labels"] != self.train_cfg.sft_ignore_idx).sum().item()
-                self.tokens_seen += non_pad * self.ddp_world_size
-            else:
-                self.tokens_seen += (
-                    int(train_batch["input_ids"].numel()) * self.ddp_world_size
+                batch_tokens = int(
+                    (train_batch["labels"] != self.train_cfg.sft_ignore_idx)
+                    .sum()
+                    .item()
                 )
+            else:
+                batch_tokens = int(train_batch["input_ids"].numel())
+            self.tokens_seen += batch_tokens * self.ddp_world_size
+            tokens_since_log += batch_tokens * self.ddp_world_size
 
             is_sync_step = (
                 micro_step_count + 1
@@ -282,7 +409,7 @@ class Trainer:
             with self._grad_sync_context(is_sync_step):
                 micro_step_loss = self._train_step(train_batch)
 
-            self.running_loss += micro_step_loss.item()
+            loss_since_log += micro_step_loss.detach()
             micro_step_count += 1
             if micro_step_count == self.train_cfg.gradient_accumulation_steps:
                 if self.train_cfg.grad_clip > 0.0:
@@ -302,41 +429,83 @@ class Trainer:
                     self.scheduler.step()
 
                 self.global_step += 1
+                steps_since_log += 1
+                if profiler is not None:
+                    profiler.step()
 
-                if self.ddp_world_size > 1:
-                    loss_tensor = torch.tensor([self.running_loss], device=self.device)
-                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-                    avg_loss = loss_tensor.item() / self.ddp_world_size
-                else:
-                    avg_loss = self.running_loss
-
-                if self.master_process:
-                    logger.info(
-                        f"Iter: {self.global_step}, LR: {self.optimizer.param_groups[0]['lr']:.2e}, Train loss: {avg_loss}"
-                    )
-                self.running_loss = 0.0
+                if self.global_step == 1:
+                    # Re-arm throughput counters: first step includes compile.
+                    loss_since_log = loss_since_log * 0.0
+                    steps_since_log = 0
+                    tokens_since_log = 0
+                    if cuda:
+                        torch.cuda.reset_peak_memory_stats()
+                    t_log = time.perf_counter()
 
                 if (
                     self.global_step % self.train_cfg.log_interval == 0
-                    and self.master_process
+                    and steps_since_log > 0
                 ):
+                    loss_t = loss_since_log / steps_since_log
+                    if self.ddp_world_size > 1:
+                        dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+                        loss_t = loss_t / self.ddp_world_size
+                    avg_loss = loss_t.item()  # single sync per log_interval
+
+                    now = time.perf_counter()
+                    dt = max(now - t_log, 1e-9)
+                    tokens_per_s = tokens_since_log / dt
+                    ms_per_step = dt / steps_since_log * 1000.0
+                    mfu = None
+                    if self.peak_flops is not None:
+                        per_gpu_tps = tokens_per_s / self.ddp_world_size
+                        mfu = self.flops_per_token * per_gpu_tps / self.peak_flops
+                    peak_mem_gb = (
+                        torch.cuda.max_memory_allocated() / 2**30 if cuda else 0.0
+                    )
                     current_lr = self.optimizer.param_groups[0]["lr"]
-                    if self.wandb_run:
-                        self.wandb_run.log(
-                            {
+
+                    if self.master_process:
+                        logger.info(
+                            f"Iter: {self.global_step}, LR: {current_lr:.2e}, "
+                            f"Train loss: {avg_loss:.4f}, {tokens_per_s:,.0f} tok/s, "
+                            f"{ms_per_step:.0f} ms/step"
+                            + (f", MFU: {mfu * 100:.1f}%" if mfu is not None else "")
+                            + (f", peak mem: {peak_mem_gb:.1f} GiB" if cuda else "")
+                        )
+                        if self.wandb_run:
+                            metrics = {
                                 "train/loss": avg_loss,
                                 "train/learning_rate": current_lr,
                                 "train/tokens_seen": self.tokens_seen,
-                            },
-                            step=self.global_step,
-                        )
+                                "perf/tokens_per_s": tokens_per_s,
+                                "perf/ms_per_step": ms_per_step,
+                                "perf/peak_mem_gib": peak_mem_gb,
+                            }
+                            if mfu is not None:
+                                metrics["perf/mfu"] = mfu
+                            self.wandb_run.log(metrics, step=self.global_step)
+
+                    loss_since_log = loss_since_log * 0.0
+                    steps_since_log = 0
+                    tokens_since_log = 0
+                    if cuda:
+                        torch.cuda.reset_peak_memory_stats()
+                    t_log = time.perf_counter()
 
                 if self.global_step % self.train_cfg.eval_interval == 0:
                     if self.ddp_world_size > 1:
                         dist.barrier()
                     eval_loss = self.evaluate()
+                    # eval_loss is identical on all ranks (allreduced), so
+                    # is_best/best_eval_loss stay consistent everywhere.
+                    is_best = eval_loss < self.best_eval_loss
+                    if is_best:
+                        self.best_eval_loss = eval_loss
                     if self.master_process:
-                        logger.info(f"Iter: {self.global_step}, Eval loss: {eval_loss}")
+                        logger.info(
+                            f"Iter: {self.global_step}, Eval loss: {eval_loss}"
+                        )
                         if self.wandb_run:
                             self.wandb_run.log(
                                 {
@@ -345,14 +514,14 @@ class Trainer:
                                 },
                                 step=self.global_step,
                             )
-                        is_best = eval_loss < self.best_eval_loss
-                        if is_best:
-                            self.best_eval_loss = eval_loss
-                        if self.train_cfg.always_save_checkpoint or is_best:
-                            self.save_checkpoint(is_best=is_best)
-                        if self.train_cfg.eval_only and self.master_process:
-                            return
+                    if self.train_cfg.always_save_checkpoint or is_best:
+                        self.save_checkpoint(is_best=is_best)
+                    t_log = time.perf_counter()  # exclude eval from throughput
+
                 micro_step_count = 0
+
+        if profiler is not None:
+            profiler.stop()
 
         if self.ddp_world_size > 1:
             dist.barrier()
@@ -362,18 +531,22 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self) -> float:
-        if self.eval_loader is None:
+        if self.eval_loader is None or len(self.eval_loader) == 0:
             logger.warning(
-                "Evaluation requested but eval_loader is None. Returning nan..."
+                "Evaluation requested but eval_loader is empty. Returning nan..."
             )
             return float("nan")
         self.model.eval()
+
+        # Fresh iterator each call: eval loss is always measured on the same
+        # leading eval_iters batches, so values are comparable across steps.
+        self._reset_eval_iterator()
 
         if self.master_process:
             logger.info(
                 f"Starting evaluation for {self.train_cfg.eval_iters} iterations..."
             )
-        total_loss = 0.0
+        total_loss = torch.zeros((), dtype=torch.float64, device=self.device)
 
         ema_ctx = (
             self.ema.average_parameters(self._get_model_module())
@@ -403,22 +576,17 @@ class Trainer:
                             "Model forward must return Tensor loss for eval."
                         )
 
-                total_loss += loss.item()
+                total_loss += loss.detach().double()
 
         self.model.train()
 
         if self.ddp_world_size > 1:
-            loss_tensor = torch.tensor(
-                [total_loss], dtype=torch.float64, device=self.device
-            )
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            global_total_loss = loss_tensor.item()
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             total_eval_iters = self.train_cfg.eval_iters * self.ddp_world_size
         else:
-            global_total_loss = total_loss
             total_eval_iters = self.train_cfg.eval_iters
 
-        avg_loss = global_total_loss / total_eval_iters
+        avg_loss = total_loss.item() / total_eval_iters
         try:
             perplexity = math.exp(avg_loss)
         except OverflowError:
@@ -432,14 +600,10 @@ class Trainer:
         return avg_loss
 
     def save_checkpoint(self, is_best: bool) -> None:
-        if self.use_fsdp2:
-            self._save_distributed_checkpoint(is_best)
-            return
         if not self.master_process:
             return
 
         logger.info(f"Saving checkpoint at step {self.global_step}...")
-        save_path = self.best_checkpoint_path if is_best else self.checkpoint_path
 
         model_to_save = self._get_model_module()
 
@@ -449,6 +613,11 @@ class Trainer:
             "global_step": self.global_step,
             "tokens_seen": self.tokens_seen,
             "best_eval_loss": self.best_eval_loss,
+            "train_epoch": self.train_epoch,
+            "samples_in_epoch": self.samples_in_epoch,
+            "wandb_run_id": (
+                self.wandb_run.id if self.wandb_run is not None else self._wandb_resume_id
+            ),
             "scheduler_state_dict": (
                 self.scheduler.state_dict() if self.scheduler else None
             ),
@@ -463,70 +632,21 @@ class Trainer:
             },
         }
 
-        tmp_save_path = f"{save_path}.tmp"
-
+        # Latest is always updated; best is a copy of it so resume_checkpoint_kind
+        # "latest" never points at a stale step.
+        tmp_save_path = f"{self.checkpoint_path}.tmp"
         torch.save(checkpoint, tmp_save_path)
-        os.replace(tmp_save_path, save_path)
-        logger.info(f"Successfully saved checkpoint to: {save_path}")
+        os.replace(tmp_save_path, self.checkpoint_path)
+        logger.info(f"Successfully saved checkpoint to: {self.checkpoint_path}")
 
         if is_best:
-            logger.info(f"This is a new best model. Eval loss: {self.best_eval_loss}")
-
-    def _save_distributed_checkpoint(self, is_best: bool) -> None:
-        from training.dcp_checkpoint import save_distributed
-
-        directory = self.dist_best_path if is_best else self.dist_checkpoint_path
-        save_distributed(self.model, directory)
-
-        if self.master_process:
-            meta = {
-                "global_step": self.global_step,
-                "tokens_seen": self.tokens_seen,
-                "best_eval_loss": self.best_eval_loss,
-                "scheduler_state_dict": (
-                    self.scheduler.state_dict() if self.scheduler else None
-                ),
-            }
-            torch.save(meta, os.path.join(directory, "meta.pt"))
+            tmp_best_path = f"{self.best_checkpoint_path}.tmp"
+            shutil.copyfile(self.checkpoint_path, tmp_best_path)
+            os.replace(tmp_best_path, self.best_checkpoint_path)
             logger.info(
-                f"Saved distributed (model-only) checkpoint to: {directory}. "
-                "Optimizer/EMA state is not persisted under FSDP2."
+                f"This is a new best model (eval loss: {self.best_eval_loss}). "
+                f"Copied to: {self.best_checkpoint_path}"
             )
-        if self.ddp_world_size > 1:
-            dist.barrier()
-
-    def _load_distributed_checkpoint(self) -> None:
-        from training.dcp_checkpoint import load_distributed
-
-        preference = self.train_cfg.resume_checkpoint_kind
-        if preference == "best":
-            candidates = [self.dist_best_path]
-        elif preference == "latest":
-            candidates = [self.dist_checkpoint_path]
-        else:
-            candidates = [self.dist_checkpoint_path, self.dist_best_path]
-        directory = next((c for c in candidates if os.path.isdir(c)), None)
-        if directory is None:
-            logger.warning("No distributed checkpoint found. Init from scratch.")
-            return
-
-        load_distributed(self.model, directory)
-
-        meta_path = os.path.join(directory, "meta.pt")
-        if os.path.exists(meta_path):
-            meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-            self.global_step = int(meta.get("global_step", 0))
-            self.tokens_seen = int(meta.get("tokens_seen", 0))
-            self.best_eval_loss = float(meta.get("best_eval_loss", float("inf")))
-            sched_state = meta.get("scheduler_state_dict")
-            if self.scheduler is not None and isinstance(sched_state, dict):
-                self.scheduler.load_state_dict(sched_state)
-        logger.info(
-            f"Loaded distributed checkpoint from {directory}. Resume at step {self.global_step}."
-        )
-
-    def _get_model_module(self) -> torch.nn.Module:
-        return self.model.module if isinstance(self.model, DDP) else self.model
 
     def _resolve_resume_checkpoint_path(self) -> Optional[str]:
         preference = self.train_cfg.resume_checkpoint_kind
@@ -549,9 +669,6 @@ class Trainer:
         return None
 
     def load_checkpoint(self) -> None:
-        if self.use_fsdp2:
-            self._load_distributed_checkpoint()
-            return
         load_path = self._resolve_resume_checkpoint_path()
         if load_path is None:
             return
@@ -569,15 +686,11 @@ class Trainer:
                     "Cannot find model_state_dict in checkpoint. Init from scratch."
                 )
                 return
-            model_state = validate_state_dict(model_state_raw)
-
-            current_is_ddp = isinstance(self.model, DDP)
-            model_to_load = self.model if current_is_ddp else self._get_model_module()
             model_state = normalize_state_dict_keys(
-                model_state,
-                add_module_prefix=current_is_ddp,
+                validate_state_dict(model_state_raw)
             )
 
+            model_to_load = self._get_model_module()
             load_result = model_to_load.load_state_dict(model_state, strict=False)
 
             if load_result.missing_keys:
@@ -590,17 +703,12 @@ class Trainer:
                 f"Model loaded {'successfully' if success else 'with some mismatches'}."
             )
 
-            self.model.to(self.device)
-            logger.info(f"Moved model to target device: {self.device}")
-
             optimizer_state = checkpoint.get("optimizer_state_dict")
             if isinstance(optimizer_state, dict):
                 try:
+                    # load_state_dict casts state tensors to each param's
+                    # device/dtype, so no manual device move is needed.
                     self.optimizer.load_state_dict(optimizer_state)
-                    for state in self.optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.to(self.device)
                     logger.info("Successfully loaded optimizer state dict.")
                 except Exception as e:
                     logger.error(f"Failed to load optimizer state dict. Error: {e}")
@@ -623,10 +731,6 @@ class Trainer:
                     logger.info("Successfully loaded GradScaler state dict")
                 except Exception as e:
                     logger.error(f"Failed to load GradScaler state dict. Error: {e}")
-            else:
-                logger.error(
-                    "Cannot find GradScaler state dict in checkpoint. Init from scratch."
-                )
 
             ema_state = checkpoint.get("ema_state_dict")
             if self.ema is not None and isinstance(ema_state, dict):
@@ -636,12 +740,18 @@ class Trainer:
             self.global_step = int(checkpoint.get("global_step", 0))
             self.tokens_seen = int(checkpoint.get("tokens_seen", 0))
             self.best_eval_loss = float(checkpoint.get("best_eval_loss", float("inf")))
+            self.train_epoch = int(checkpoint.get("train_epoch", 0))
+            self.samples_in_epoch = int(checkpoint.get("samples_in_epoch", 0))
+            wandb_run_id = checkpoint.get("wandb_run_id")
+            if isinstance(wandb_run_id, str):
+                self._wandb_resume_id = wandb_run_id
 
             logger.info(
                 f"Checkpoint loaded succesfully from {load_path}. Resume training from global step: {self.global_step}"
             )
             logger.info(
-                f"Tokens already seen according to checkpoint: {self.tokens_seen}"
+                f"Tokens already seen according to checkpoint: {self.tokens_seen}. "
+                f"Data position: epoch {self.train_epoch}, {self.samples_in_epoch} samples in."
             )
             logger.info(f"Current best evaluation loss: {self.best_eval_loss}")
 

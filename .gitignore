@@ -181,3 +181,6 @@ out/*
 wandb/*
 .vscode/*
 external/*
+
+.claude/*
+CLAUDE.md

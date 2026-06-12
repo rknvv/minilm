@@ -52,7 +52,7 @@ def setup_distributed(cfg: TrainConfig) -> DistInfo:
 
     cfg.device = device
 
-    seed = 42 + seed_offset
+    seed = cfg.seed + seed_offset
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

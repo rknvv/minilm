@@ -73,17 +73,7 @@ def train_model(yaml_path: str | None = None) -> None:
         else:
             load_pretrained_weights(model, train_cfg.pretrained_checkpoint)
 
-    fsdp_mesh = None
-    if train_cfg.parallel == "fsdp2" and dist_info.world_size > 1:
-        from training.parallel import apply_fsdp2, build_fsdp_mesh
-
-        model = model.to(dist_info.device)
-        fsdp_mesh = build_fsdp_mesh(dist_info.world_size)
-        model = apply_fsdp2(
-            model, train_cfg.dtype, fsdp_mesh, train_cfg.reshard_after_forward
-        )
-
-    optimizer = build_optimizer(model, train_cfg, fsdp_mesh=fsdp_mesh)
+    optimizer = build_optimizer(model, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
 
     trainer = Trainer(

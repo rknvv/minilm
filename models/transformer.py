@@ -1,34 +1,52 @@
+from typing import Any, Optional, Tuple
+
 import torch
 import torch.nn as nn
 
 from config import ModelArgs
 from models.layers import Attention, FeedForward, RMSNorm
 
-class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.attention = Attention(args)
-        self.feed_forward = FeedForward(
-            dim=args.dim,
-            hidden_dim=4 * args.dim,
-            multiple_of=args.multiple_of,
-            ffn_dim_multiplier=args.ffn_dim_multiplier,
-            args=args,
-        )
-        self.attn_norm = RMSNorm(args.dim, norm_eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, norm_eps=args.norm_eps)
 
-        self.dropout = nn.Dropout(args.dropout)
+class TransformerBlock(nn.Module):
+    """Gemma-3 decoder layer with sandwich normalization."""
+
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.attention = Attention(args, layer_idx)
+        self.feed_forward = FeedForward(args.dim, args.intermediate_size)
+
+        self.input_layernorm = RMSNorm(args.dim, norm_eps=args.norm_eps)
+        self.post_attention_layernorm = RMSNorm(args.dim, norm_eps=args.norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(args.dim, norm_eps=args.norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(args.dim, norm_eps=args.norm_eps)
+
+        self.is_global = self.attention.is_global
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        rope: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_ctx: Tuple[Optional[torch.Tensor], Any, bool],
     ) -> torch.Tensor:
-        attn_out = self.attention(self.attn_norm(x), start_pos, cos, sin)
-        h = x + self.dropout(attn_out)
-        ffn_out = self.feed_forward(self.ffn_norm(h))
-        out = h + self.dropout(ffn_out)
-        return out
+        cos_g, sin_g, cos_l, sin_l = rope
+        local_mask, local_block_mask, use_cache = attn_ctx
+        if self.is_global:
+            cos, sin = cos_g, sin_g
+        else:
+            cos, sin = cos_l, sin_l
+
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.attention(
+            x, start_pos, cos, sin, local_mask, local_block_mask, use_cache
+        )
+        x = self.post_attention_layernorm(x)
+        x = residual + x
+
+        residual = x
+        x = self.pre_feedforward_layernorm(x)
+        x = self.feed_forward(x)
+        x = self.post_feedforward_layernorm(x)
+        x = residual + x
+        return x

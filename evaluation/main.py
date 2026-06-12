@@ -11,6 +11,7 @@ from config import ModelArgs, TrainConfig
 from models.minilm import MiniLM
 from models.lm_head import MiniLMForCausalLM
 from dataio.dataset import MemmapDataset
+from dataio.loaders import resolve_token_dtype
 from training.checkpoint import extract_model_state_dict, normalize_state_dict_keys
 
 logging.basicConfig(level=logging.INFO)
@@ -72,7 +73,13 @@ def perplexity(
 
     if val_bin is None:
         val_bin = os.path.join(train_cfg.dataset_dir, "val.bin")
-    dataset = MemmapDataset(val_bin, model_args.max_seq_len)
+    token_dtype = resolve_token_dtype(train_cfg, model_args)
+    dataset = MemmapDataset(
+        val_bin,
+        model_args.max_seq_len,
+        memmap_dtype=token_dtype,
+        vocab_size=model_args.vocab_size,
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     total_loss, n_batches = 0.0, 0

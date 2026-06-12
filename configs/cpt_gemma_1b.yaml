@@ -1,0 +1,73 @@
+train:
+  task: "pretrain"
+  out_dir: "./out_cpt_gemma_1b"
+  dataset_dir: "./data/pretrain"
+  # Token dtype of train.bin/val.bin: resolved from meta.json written by
+  # preprocess_text.py, else from vocab_size (184k vocab -> uint32).
+  token_dtype: "auto"
+
+  # Start continual pretraining from the pruned Gemma-3-1B (RU+EN, v2) checkpoint:
+  # frequency+merge-closure prune 262144 -> 153856 (601*256, GEMM-aligned).
+  # A .safetensors path triggers the HF Gemma weight loader (see training/checkpoint.py).
+  pretrained_checkpoint: "./external/gemma3-1b-base/gemma-3-1b-pt-ruen-v2/model.safetensors"
+  resume_from_checkpoint: false
+  resume_checkpoint_kind: "latest"
+  seed: 42
+
+  eval_interval: 1000
+  log_interval: 20
+  eval_iters: 100
+  always_save_checkpoint: true
+
+  wandb_log: true
+  wandb_project: "gemma3_1b_cpt_ruen"
+  wandb_run_name: "cpt_gemma_1b"
+
+  gradient_accumulation_steps: 4
+  train_batch_size: 8
+  eval_batch_size: 8
+  num_workers: 8
+
+  # AdamW lr (embeddings/head/scalars). Muon hidden matrices run at muon_lr,
+  # conventionally ~10-20x the AdamW lr; tune the ratio on a short run.
+  learning_rate: 0.00005
+  muon_lr: 0.0005
+  max_iters: 100000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+
+  decay_lr: true
+  warmup_iters: 1000
+  min_lr_ratio: 0.1
+
+  device: "cuda"
+  dtype: "bfloat16"
+  compile: true
+  backend: "nccl"
+  eval_only: false
+
+model:
+  dim: 1152
+  n_layers: 26
+  n_heads: 4
+  n_kv_heads: 1
+  head_dim: 256
+  vocab_size: 153856
+  intermediate_size: 6912
+  norm_eps: 0.000001
+  max_seq_len: 2048
+  dropout: 0.0
+
+  query_pre_attn_scalar: 256.0
+  rope_theta: 1000000.0
+  rope_local_base_freq: 10000.0
+  sliding_window: 512
+  sliding_window_pattern: 6
+
+  # Off: with Liger FLCE the activations fit in 80GB at B=8/T=2048 and full
+  # recompute costs ~25-35% throughput. Flip on if OOM.
+  gradient_checkpointing: false
+  ce_chunk_size: 2048
+  use_liger: true
