@@ -1,7 +1,7 @@
 import argparse
 import logging
 
-from config import load_config
+from config import load_config, TrainConfig, ModelArgs
 from models.minilm import MiniLM
 from models.lm_head import MiniLMForCausalLM
 from dataio.loaders import build_datasets, build_dataloaders
@@ -30,11 +30,30 @@ SNAPSHOT_CODE_MODULES = [
 ]
 
 
-def train_model(yaml_path: str | None = None) -> None:
+def train_model(yaml_path: str | None = None, **overrides) -> None:
     if yaml_path is None:
         raise ValueError("yaml_path is required.")
 
     train_cfg, model_args = load_config(yaml_path)
+
+    if overrides:
+        train_over = {
+            k: v for k, v in overrides.items() if k in TrainConfig.model_fields
+        }
+        model_over = {k: v for k, v in overrides.items() if k in ModelArgs.model_fields}
+        unknown = set(overrides) - set(train_over) - set(model_over)
+        if unknown:
+            raise ValueError(
+                f"Unknown override keys: {sorted(unknown)}. "
+                f"Valid: train={sorted(TrainConfig.model_fields)}, "
+                f"model={sorted(ModelArgs.model_fields)}"
+            )
+        if train_over:
+            train_cfg = TrainConfig(**{**train_cfg.model_dump(), **train_over})
+        if model_over:
+            model_args = ModelArgs(**{**model_args.model_dump(), **model_over})
+        log.info(f"Applied CLI overrides: {overrides}")
+
     dist_info = setup_distributed(train_cfg)
 
     if dist_info.master:
@@ -62,7 +81,9 @@ def train_model(yaml_path: str | None = None) -> None:
     model = MiniLMForCausalLM(MiniLM(model_args), model_args)
     if dist_info.master:
         n_params = sum(p.numel() for p in model.parameters())
-        log.info(f"MiniLMForCausalLM: vocab_size={model_args.vocab_size}, params={n_params:,}")
+        log.info(
+            f"MiniLMForCausalLM: vocab_size={model_args.vocab_size}, params={n_params:,}"
+        )
 
     if train_cfg.pretrained_checkpoint:
         if train_cfg.resume_from_checkpoint:
@@ -73,7 +94,17 @@ def train_model(yaml_path: str | None = None) -> None:
         else:
             load_pretrained_weights(model, train_cfg.pretrained_checkpoint)
 
-    optimizer = build_optimizer(model, train_cfg)
+    muon_pg = None
+    if dist_info.world_size > 1 and train_cfg.muon_distributed:
+        import torch.distributed as dist
+
+        muon_pg = dist.group.WORLD
+        if dist_info.master:
+            log.info(
+                "Muon: distributed Newton-Schulz over %d ranks (muon_distributed=true)",
+                dist_info.world_size,
+            )
+    optimizer = build_optimizer(model, train_cfg, process_group=muon_pg)
     scheduler = build_scheduler(optimizer, train_cfg)
 
     trainer = Trainer(

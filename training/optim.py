@@ -14,7 +14,11 @@ MUON_MOMENTUM = 0.95
 def build_optimizer(
     model: torch.nn.Module,
     train_cfg: TrainConfig,
+    process_group=None,
 ) -> torch.optim.Optimizer:
+    """process_group: DDP group for dion's distributed Muon — each rank
+    orthogonalizes its share of the hidden-matrix stack and all_gathers the
+    results (identical math, ~1/world_size the Newton-Schulz compute)."""
     from dion import Muon
 
     hidden_matrix_params = []
@@ -60,10 +64,12 @@ def build_optimizer(
     ]
     return Muon(
         param_groups,
+        distributed_mesh=process_group,
         lr=adamw_lr,
         mu=MUON_MOMENTUM,
         betas=(train_cfg.beta1, train_cfg.beta2),
         weight_decay=train_cfg.weight_decay,
+        use_triton=train_cfg.muon_use_triton,
     )
 
 

@@ -104,7 +104,7 @@ class MiniLM(nn.Module):
         h = self.tok_embeddings(tokens)
         # Gemma scales embeddings by sqrt(dim); the normalizer is cast to the
         # activation dtype first (this quantization is part of the trained scale).
-        normalizer = torch.tensor(self.args.dim ** 0.5, dtype=h.dtype)
+        normalizer = torch.tensor(self.args.dim**0.5, dtype=h.dtype)
         h = h * normalizer
 
         sl = slice(start_pos, start_pos + seq_len)
@@ -129,7 +129,12 @@ class MiniLM(nn.Module):
             # FlexAttention does not support dropout; fall back to a dense
             # boolean mask when attention dropout is active.
             dropout_active = self.training and self.args.dropout > 0.0
-            if HAS_FLEX and h.is_cuda and not dropout_active:
+            if (
+                HAS_FLEX
+                and h.is_cuda
+                and not dropout_active
+                and self.args.use_flex_attention
+            ):
                 local_block_mask = self._get_flex_block_mask(seq_len, h.device)
             else:
                 local_mask = self._get_local_mask(seq_len, h.device)
@@ -140,9 +145,7 @@ class MiniLM(nn.Module):
         for layer in self.layers:
             block = cast(TransformerBlock, layer)
             if use_checkpoint:
-                h = checkpoint(
-                    block, h, start_pos, rope, attn_ctx, use_reentrant=False
-                )
+                h = checkpoint(block, h, start_pos, rope, attn_ctx, use_reentrant=False)
             else:
                 h = block(h, start_pos, rope, attn_ctx)
 

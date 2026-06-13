@@ -183,4 +183,4 @@ wandb/*
 external/*
 
 .claude/*
-CLAUDE.md
+docs/*

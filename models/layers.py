@@ -35,7 +35,19 @@ _flex_attention_compiled = None
 
 
 def _flex_sdpa(q, k, v, block_mask, scale: float, enable_gqa: bool):
-    """flex_attention is only fast when compiled; compile once, lazily."""
+    """flex_attention is only fast when compiled.
+
+    Under an outer torch.compile trace (the trainer compiles the trunk), call
+    it directly: the outer graph captures the flex HOP natively, instead of
+    graph-breaking on a nested torch.compile wrapper. In pure eager, fall back
+    to a lazily-compiled wrapper. Validated vs original gemma-3-1b-pt on both
+    paths (verify_gemma.py PASS, argmax 100%); re-run against the pruned v2
+    checkpoint when it lands (project rule for models/ diffs).
+    """
+    if torch.compiler.is_compiling():
+        return flex_attention(
+            q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
+        )
     global _flex_attention_compiled
     if _flex_attention_compiled is None:
         _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
@@ -191,7 +203,7 @@ class Attention(nn.Module):
 
         self.is_global = (layer_idx + 1) % args.sliding_window_pattern == 0
         self.sliding_window = args.sliding_window
-        self.scale = args.query_pre_attn_scalar ** -0.5
+        self.scale = args.query_pre_attn_scalar**-0.5
 
         self.wq = nn.Linear(args.dim, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)

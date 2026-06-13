@@ -1,31 +1,40 @@
-# Profiling / smoke config: single A100, short run, real CPT shapes.
-# Run:  python main.py --yaml_path=configs/profile_a100_1gpu.yaml
-# Data: ./data/profile (60k fineweb2-ru docs, ~100M tokens, v2 tokenizer, uint32).
-# Steady-state numbers come from the logs at iters 10..60 (step 1 with compile
-# is excluded from throughput counters automatically).
-# If OOM (A100-40GB): set gradient_checkpointing: true, or batch 4 + accum 8.
+# SPEED-prototype profiling config: single A100, random-init, synthetic data.
+# Throughput is weight-/value-independent, so this profiles the real CPT shapes
+# (Gemma-3-1B, vocab 153856, seq 2048) without the real checkpoint or dataset.
+#
+# Setup:  python scripts/make_synth_profile_data.py
+# Run:    python main.py --yaml_path=configs/profile_a100_1gpu_synth.yaml
+# Numbers come from logs at iters 10..60 (step 1 with compile excluded automatically).
+#
+# Diff vs profile_a100_1gpu.yaml: dataset_dir, pretrained_checkpoint:null (-> random
+# init), eval_interval raised above max_iters (skip eval during the speed window).
+#
+# Tuned stack (see out_profile/REPORT.md, A100 measured): trunk-only compile with
+# max-autotune (fixes the flex-attention backward template: 36% -> 5% of GPU time)
+# + batch 16 / accum 2 (fits in 68 GiB thanks to compile rematerializing the fp32
+# upcasts). ~24.5k tok/s, MFU ~42.6% vs 8.8k/15.3% eager. Effective batch still 32.
 train:
   task: "pretrain"
   out_dir: "./out_profile"
-  dataset_dir: "./data/profile"
+  dataset_dir: "./data/profile_synth"
   token_dtype: "auto"
 
-  pretrained_checkpoint: "./external/gemma3-1b-base/gemma-3-1b-pt-ruen-v2/model.safetensors"
+  pretrained_checkpoint: null          # random init (no weights needed for speed)
   resume_from_checkpoint: false
   seed: 42
 
-  eval_interval: 50
+  eval_interval: 1000                  # > max_iters -> eval does not run
   log_interval: 10
   eval_iters: 50
-  always_save_checkpoint: true
+  always_save_checkpoint: false
 
   wandb_log: false
   wandb_project: "gemma3_1b_cpt_ruen"
-  wandb_run_name: "profile_a100"
+  wandb_run_name: "profile_a100_synth"
 
-  gradient_accumulation_steps: 4
-  train_batch_size: 8
-  eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  train_batch_size: 16
+  eval_batch_size: 16   # match train shape -> no recompile on first eval
   num_workers: 8
 
   learning_rate: 0.00005
@@ -43,9 +52,12 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   compile: true
+  # max-autotune tunes the flex-attention backward template configs (the default
+  # ones are pathological for H=4/hd=256/MQA: 30ms bwd vs 0.5ms fwd). First
+  # compile takes ~7 min cold; the Inductor cache makes reruns cheap.
+  compile_mode: "max-autotune-no-cudagraphs"
   backend: "nccl"
   # Chrome trace of optimizer steps 11-13 -> ./out_profile/trace_*.json
-  # (open in chrome://tracing or https://ui.perfetto.dev)
   profile: true
   eval_only: false
 
@@ -68,5 +80,11 @@ model:
   sliding_window_pattern: 6
 
   gradient_checkpointing: false
-  ce_chunk_size: 2048
+  # use_liger + ce_chunk_size>0 = VENDORED liger FLCE with our chunking
+  # (models/fused_loss.py): liger's own heuristic degenerates to 256-row
+  # chunks at this vocab (128 tiny GEMMs + 128 grad_weight accumulator passes
+  # per micro-step). Measured A100: 34.2k tok/s MFU 59.4% vs 24.6k stock liger
+  # vs 27.2k checkpointed chunked-CE. Peak 72.0 GiB at B16; drop chunk to 4096
+  # (-2.3 GiB, -1% speed) if OOM. Parity: scripts/test_loss_parity_cuda.py.
+  ce_chunk_size: 8192
   use_liger: true

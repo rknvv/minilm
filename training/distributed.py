@@ -30,9 +30,7 @@ def setup_distributed(cfg: TrainConfig) -> DistInfo:
         world_size = int(os.environ["WORLD_SIZE"])
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend=cfg.backend, device_id=torch.device(device)
-        )
+        dist.init_process_group(backend=cfg.backend, device_id=torch.device(device))
         master = rank == 0
         seed_offset = rank
         logger.info(f"DDP enabled. Rank {rank}/{world_size} on device {device}")
@@ -60,6 +58,7 @@ def setup_distributed(cfg: TrainConfig) -> DistInfo:
         torch.cuda.manual_seed_all(seed)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     return DistInfo(rank, local_rank, world_size, device, master, seed)
 

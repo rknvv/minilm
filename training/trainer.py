@@ -3,7 +3,7 @@
 import math
 import logging
 import os
-import shutil
+import threading
 import time
 from contextlib import nullcontext
 from typing import Any, Iterator, Optional, cast
@@ -20,15 +20,27 @@ from config import TrainConfig, ModelArgs
 
 logger = logging.getLogger(__name__)
 
-# Dense bf16/fp16 peak TFLOPs (no sparsity) for MFU estimation.
 _GPU_PEAK_FLOPS = {
     "H200": 989e12,
     "H100": 989e12,
     "A100": 312e12,
     "L40S": 362e12,
+    "RTX 5090": 209.5e12,
     "RTX 4090": 165e12,
     "RTX 3090": 71e12,
 }
+
+
+def _to_cpu(obj: Any) -> Any:
+    """Deep-copy tensors in a (nested) state-dict structure to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        converted = [_to_cpu(v) for v in obj]
+        return tuple(converted) if isinstance(obj, tuple) else converted
+    return obj
 
 
 class Trainer:
@@ -73,25 +85,25 @@ class Trainer:
             self.device = f"cuda:{self.ddp_local_rank}"
             torch.cuda.set_device(self.ddp_local_rank)
             self.model = self.model.to(self.device)
-            # DDP first, compile second: lets DDPOptimizer split the graph at
-            # bucket boundaries so allreduce overlaps with compiled backward.
-            self.model = DDP(
-                self.model,
+            ddp_kwargs: dict[str, Any] = dict(
                 device_ids=[self.ddp_local_rank],
                 output_device=self.ddp_local_rank,
                 gradient_as_bucket_view=True,
             )
+            if self.train_cfg.ddp_bucket_cap_mb is not None:
+                ddp_kwargs["bucket_cap_mb"] = self.train_cfg.ddp_bucket_cap_mb
+            self.model = DDP(self.model, **ddp_kwargs)
             logger.info(
                 f"Rank [{self.ddp_rank}] local rank [{self.ddp_local_rank}]: Wrapped model with DDP"
             )
             if self.train_cfg.compile:
-                self.model = cast(torch.nn.Module, torch.compile(self.model))
+                self.model = self._compile_model(self.model)
                 if self.master_process:
                     logger.info("Compiled DDP-wrapped model.")
         else:
             self.model = self.model.to(self.device)
             if self.train_cfg.compile:
-                self.model = cast(torch.nn.Module, torch.compile(self.model))
+                self.model = self._compile_model(self.model)
                 if self.master_process:
                     logger.info("Compiled model.")
 
@@ -106,8 +118,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(  # type: ignore
             "cuda",
             enabled=(
-                self.train_cfg.dtype == "float16"
-                and autocast_device_type == "cuda"
+                self.train_cfg.dtype == "float16" and autocast_device_type == "cuda"
             ),
         )
 
@@ -121,7 +132,7 @@ class Trainer:
         self.best_eval_loss = float("inf")
 
         self.train_epoch = 0
-        self.samples_in_epoch = 0  # per-rank samples consumed in current epoch
+        self.samples_in_epoch = 0
         self.eval_epoch = 0
         self.train_iter: Optional[Iterator[dict[str, torch.Tensor]]] = None
         self.eval_iter: Optional[Iterator[dict[str, torch.Tensor]]] = None
@@ -133,6 +144,8 @@ class Trainer:
         if self.train_cfg.ema is not None:
             self.ema = EMA(self._get_model_module(), self.train_cfg.ema)
 
+        self._save_thread: Optional[threading.Thread] = None
+
         self._wandb_resume_id: Optional[str] = None
         if self.train_cfg.resume_from_checkpoint:
             self.load_checkpoint()
@@ -143,6 +156,30 @@ class Trainer:
 
         if self.master_process:
             self._log_loss_path()
+
+    def _compile_model(self, m: torch.nn.Module) -> torch.nn.Module:
+        """Compile the transformer trunk in place; keep the loss head eager."""
+        kwargs: dict[str, Any] = {}
+        backend = self.train_cfg.compile_backend
+        mode = self.train_cfg.compile_mode
+        if backend and backend != "inductor":
+            kwargs["backend"] = backend
+        elif mode:
+            kwargs["mode"] = mode
+
+        base = m.module if isinstance(m, DDP) else m
+        trunk = getattr(base, "model", None)
+        if isinstance(trunk, torch.nn.Module):
+            trunk.compile(**kwargs)
+            if self.master_process:
+                logger.info(
+                    "Compiled transformer trunk in place (loss head stays eager)"
+                    + (f", kwargs={kwargs}" if kwargs else "")
+                )
+            return m
+        if self.master_process and kwargs:
+            logger.info(f"torch.compile kwargs: {kwargs}")
+        return cast(torch.nn.Module, torch.compile(m, **kwargs))
 
     def _init_wandb(self) -> None:
         try:
@@ -166,11 +203,18 @@ class Trainer:
 
     def _log_loss_path(self) -> None:
         from models.layers import HAS_LIGER
+        from models.lm_head import HAS_FUSED_LOSS
 
         args = self.model_cfg
         on_cuda = self.device.startswith("cuda")
         if args.use_liger and HAS_LIGER and on_cuda:
-            path = "liger fused linear cross-entropy"
+            if HAS_FUSED_LOSS and args.ce_chunk_size and args.ce_chunk_size > 0:
+                path = (
+                    "liger fused linear cross-entropy "
+                    f"(vendored large-chunk, chunk={args.ce_chunk_size})"
+                )
+            else:
+                path = "liger fused linear cross-entropy"
         elif args.ce_chunk_size and args.ce_chunk_size > 0:
             path = f"chunked cross-entropy (chunk={args.ce_chunk_size})"
             if args.use_liger and not HAS_LIGER:
@@ -193,23 +237,19 @@ class Trainer:
 
         attn_params = d * H * hd + 2 * d * kv_heads * hd + H * hd * d
         mlp_params = 3 * d * m.intermediate_size
-        head_params = d * m.vocab_size  # tied head matmul still costs FLOPs
+        head_params = d * m.vocab_size
 
         def avg_kv_len(window: Optional[int]) -> float:
             if window is None or window >= T:
                 return (T + 1) / 2
             return (window * (window + 1) / 2 + (T - window) * window) / T
 
-        n_global = sum(
-            1 for i in range(L) if (i + 1) % m.sliding_window_pattern == 0
-        )
+        n_global = sum(1 for i in range(L) if (i + 1) % m.sliding_window_pattern == 0)
         n_local = L - n_global
-        attn_fwd = (
-            4 * H * hd * (n_global * avg_kv_len(None) + n_local * avg_kv_len(w))
-        )
+        attn_fwd = 4 * H * hd * (n_global * avg_kv_len(None) + n_local * avg_kv_len(w))
 
         fwd = 2 * (L * (attn_params + mlp_params) + head_params) + attn_fwd
-        return 3.0 * fwd  # backward ~= 2x forward
+        return 3.0 * fwd
 
     def _detect_peak_flops(self) -> Optional[float]:
         if not self.device.startswith("cuda") or not torch.cuda.is_available():
@@ -222,15 +262,12 @@ class Trainer:
         return None
 
     def _build_profiler(self):
-        """torch.profiler armed at optimizer-step granularity (see TrainConfig.profile)."""
         if not self.train_cfg.profile:
             return None
         from torch.profiler import ProfilerActivity, profile, schedule
 
         cuda = self.device.startswith("cuda")
-        activities = [ProfilerActivity.CPU] + (
-            [ProfilerActivity.CUDA] if cuda else []
-        )
+        activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])
         sort_key = "self_cuda_time_total" if cuda else "self_cpu_time_total"
 
         def on_trace_ready(prof) -> None:
@@ -247,8 +284,6 @@ class Trainer:
 
         prof = profile(
             activities=activities,
-            # wait covers compile/autotune steps; active=3 captures 3 full
-            # optimizer steps (incl. all grad-accum microsteps).
             schedule=schedule(wait=8, warmup=2, active=3, repeat=1),
             on_trace_ready=on_trace_ready,
         )
@@ -379,7 +414,6 @@ class Trainer:
         micro_step_count = 0
         profiler = self._build_profiler()
 
-        # GPU-side accumulators: no .item()/allreduce until log_interval.
         loss_since_log = torch.zeros((), device=self.device)
         steps_since_log = 0
         tokens_since_log = 0
@@ -434,7 +468,6 @@ class Trainer:
                     profiler.step()
 
                 if self.global_step == 1:
-                    # Re-arm throughput counters: first step includes compile.
                     loss_since_log = loss_since_log * 0.0
                     steps_since_log = 0
                     tokens_since_log = 0
@@ -450,7 +483,7 @@ class Trainer:
                     if self.ddp_world_size > 1:
                         dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
                         loss_t = loss_t / self.ddp_world_size
-                    avg_loss = loss_t.item()  # single sync per log_interval
+                    avg_loss = loss_t.item()
 
                     now = time.perf_counter()
                     dt = max(now - t_log, 1e-9)
@@ -494,18 +527,15 @@ class Trainer:
                     t_log = time.perf_counter()
 
                 if self.global_step % self.train_cfg.eval_interval == 0:
+                    t_block = time.perf_counter()
                     if self.ddp_world_size > 1:
                         dist.barrier()
                     eval_loss = self.evaluate()
-                    # eval_loss is identical on all ranks (allreduced), so
-                    # is_best/best_eval_loss stay consistent everywhere.
                     is_best = eval_loss < self.best_eval_loss
                     if is_best:
                         self.best_eval_loss = eval_loss
                     if self.master_process:
-                        logger.info(
-                            f"Iter: {self.global_step}, Eval loss: {eval_loss}"
-                        )
+                        logger.info(f"Iter: {self.global_step}, Eval loss: {eval_loss}")
                         if self.wandb_run:
                             self.wandb_run.log(
                                 {
@@ -516,12 +546,20 @@ class Trainer:
                             )
                     if self.train_cfg.always_save_checkpoint or is_best:
                         self.save_checkpoint(is_best=is_best)
-                    t_log = time.perf_counter()  # exclude eval from throughput
+                    if self.master_process:
+                        logger.info(
+                            "eval+checkpoint block: "
+                            f"{time.perf_counter() - t_block:.1f}s "
+                            "(disk write continues in background)"
+                        )
+                    t_log = time.perf_counter()
 
                 micro_step_count = 0
 
         if profiler is not None:
             profiler.stop()
+
+        self._join_pending_save()
 
         if self.ddp_world_size > 1:
             dist.barrier()
@@ -538,8 +576,6 @@ class Trainer:
             return float("nan")
         self.model.eval()
 
-        # Fresh iterator each call: eval loss is always measured on the same
-        # leading eval_iters batches, so values are comparable across steps.
         self._reset_eval_iterator()
 
         if self.master_process:
@@ -599,24 +635,33 @@ class Trainer:
 
         return avg_loss
 
+    def _join_pending_save(self) -> None:
+        if self._save_thread is not None:
+            self._save_thread.join()
+            self._save_thread = None
+
     def save_checkpoint(self, is_best: bool) -> None:
+        """Snapshot state to CPU, then serialize on a background thread."""
         if not self.master_process:
             return
 
-        logger.info(f"Saving checkpoint at step {self.global_step}...")
+        self._join_pending_save()
+        logger.info(f"Saving checkpoint at step {self.global_step} (async)...")
 
         model_to_save = self._get_model_module()
 
         checkpoint = {
-            "model_state_dict": model_to_save.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "model_state_dict": _to_cpu(model_to_save.state_dict()),
+            "optimizer_state_dict": _to_cpu(self.optimizer.state_dict()),
             "global_step": self.global_step,
             "tokens_seen": self.tokens_seen,
             "best_eval_loss": self.best_eval_loss,
             "train_epoch": self.train_epoch,
             "samples_in_epoch": self.samples_in_epoch,
             "wandb_run_id": (
-                self.wandb_run.id if self.wandb_run is not None else self._wandb_resume_id
+                self.wandb_run.id
+                if self.wandb_run is not None
+                else self._wandb_resume_id
             ),
             "scheduler_state_dict": (
                 self.scheduler.state_dict() if self.scheduler else None
@@ -632,21 +677,38 @@ class Trainer:
             },
         }
 
-        # Latest is always updated; best is a copy of it so resume_checkpoint_kind
-        # "latest" never points at a stale step.
-        tmp_save_path = f"{self.checkpoint_path}.tmp"
-        torch.save(checkpoint, tmp_save_path)
-        os.replace(tmp_save_path, self.checkpoint_path)
-        logger.info(f"Successfully saved checkpoint to: {self.checkpoint_path}")
+        step = self.global_step
+        best_loss = self.best_eval_loss
 
-        if is_best:
-            tmp_best_path = f"{self.best_checkpoint_path}.tmp"
-            shutil.copyfile(self.checkpoint_path, tmp_best_path)
-            os.replace(tmp_best_path, self.best_checkpoint_path)
-            logger.info(
-                f"This is a new best model (eval loss: {self.best_eval_loss}). "
-                f"Copied to: {self.best_checkpoint_path}"
-            )
+        def _write() -> None:
+            try:
+                tmp_save_path = f"{self.checkpoint_path}.tmp"
+                torch.save(checkpoint, tmp_save_path)
+                os.replace(tmp_save_path, self.checkpoint_path)
+                logger.info(
+                    f"Checkpoint for step {step} saved to: {self.checkpoint_path}"
+                )
+
+                if is_best:
+                    tmp_best_path = f"{self.best_checkpoint_path}.tmp"
+                    if os.path.exists(tmp_best_path):
+                        os.remove(tmp_best_path)
+                    os.link(self.checkpoint_path, tmp_best_path)
+                    os.replace(tmp_best_path, self.best_checkpoint_path)
+                    logger.info(
+                        f"New best model (eval loss: {best_loss}). "
+                        f"Hardlinked to: {self.best_checkpoint_path}"
+                    )
+            except Exception:
+                logger.exception(
+                    f"Async checkpoint write FAILED at step {step} "
+                    f"(ckpt.pt keeps its previous state)."
+                )
+
+        self._save_thread = threading.Thread(
+            target=_write, name="ckpt-save", daemon=True
+        )
+        self._save_thread.start()
 
     def _resolve_resume_checkpoint_path(self) -> Optional[str]:
         preference = self.train_cfg.resume_checkpoint_kind
@@ -706,8 +768,6 @@ class Trainer:
             optimizer_state = checkpoint.get("optimizer_state_dict")
             if isinstance(optimizer_state, dict):
                 try:
-                    # load_state_dict casts state tensors to each param's
-                    # device/dtype, so no manual device move is needed.
                     self.optimizer.load_state_dict(optimizer_state)
                     logger.info("Successfully loaded optimizer state dict.")
                 except Exception as e:
@@ -761,6 +821,7 @@ class Trainer:
             )
 
     def cleanup(self) -> None:
+        self._join_pending_save()
         if self.wandb_run is not None:
             logger.info("Finish WandB session...")
             self.wandb_run.finish()

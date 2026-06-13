@@ -3,6 +3,7 @@ from typing import Literal, Optional, Tuple
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+
 class ModelArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
@@ -31,6 +32,7 @@ class ModelArgs(BaseModel):
     ce_chunk_size: int = Field(default=0, ge=0)
 
     use_liger: bool = False
+    use_flex_attention: bool = True
 
     @model_validator(mode="after")
     def _check_shapes(self) -> "ModelArgs":
@@ -42,14 +44,7 @@ class ModelArgs(BaseModel):
 
     @classmethod
     def from_hf(cls, hf_config: dict, **overrides) -> "ModelArgs":
-        """Build ModelArgs from a HF Gemma3 config.json dict.
-
-        Architecture fields come from the HF config; training-only fields
-        (max_seq_len, dropout, gradient_checkpointing, ce_chunk_size, use_liger)
-        keep their defaults unless passed via overrides. Note: HF
-        max_position_embeddings (32768) is NOT used for max_seq_len — set it
-        explicitly via overrides to bound RoPE/KV-cache/mask memory.
-        """
+        """Build ModelArgs from a HF Gemma3 config.json dict."""
         args = dict(
             dim=hf_config["hidden_size"],
             n_layers=hf_config["num_hidden_layers"],
@@ -68,6 +63,7 @@ class ModelArgs(BaseModel):
         args.update(overrides)
         return cls(**args)
 
+
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -85,8 +81,6 @@ class TrainConfig(BaseModel):
     resume_checkpoint_kind: Literal["latest", "best", "auto"] = "latest"
 
     seed: int = 42
-    # Storage dtype of train.bin/val.bin token ids. "auto" resolves from
-    # meta.json written by preprocess_text.py, else from vocab_size.
     token_dtype: Literal["auto", "uint16", "uint32"] = "auto"
 
     eval_interval: int = Field(default=10, ge=1)
@@ -103,10 +97,10 @@ class TrainConfig(BaseModel):
 
     num_workers: int = Field(default=4, ge=0)
 
-    # AdamW lr (embeddings/head/scalars). Muon hidden matrices use muon_lr,
-    # conventionally ~10-20x higher; falls back to learning_rate if unset.
     learning_rate: float = 6e-4
     muon_lr: Optional[float] = None
+    muon_use_triton: bool = False
+    muon_distributed: bool = True
     max_iters: int = Field(default=600000, ge=1)
     weight_decay: float = 1e-1
     beta1: float = 0.9
@@ -114,16 +108,18 @@ class TrainConfig(BaseModel):
     grad_clip: float = 1.0
     decay_lr: bool = True
     warmup_iters: int = Field(default=2000, ge=0)
-    # Cosine decays to min_lr_ratio * peak instead of 0.
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
 
     device: str = "cuda"
     dtype: Literal["float32", "float16", "bfloat16"] = "bfloat16"
+
+    ddp_bucket_cap_mb: Optional[int] = None
     compile: bool = False
+
+    compile_mode: Optional[str] = None
+    compile_backend: str = "inductor"
     backend: str = "nccl"
 
-    # torch.profiler: skips 8 steps (compile warmup), warms 2, traces 3 full
-    # optimizer steps; chrome trace + op table land in out_dir.
     profile: bool = False
 
     ema: Optional[float] = None

@@ -10,7 +10,16 @@ from config import ModelArgs
 from models.minilm import MiniLM
 from models.layers import liger_enabled, liger_flce, sample_top_p
 
+try:
+    from models.fused_loss import flce_large_chunk
+
+    HAS_FUSED_LOSS = True
+except ImportError:
+    flce_large_chunk = None
+    HAS_FUSED_LOSS = False
+
 logger = logging.getLogger()
+
 
 class MiniLMForCausalLM(nn.Module):
     def __init__(self, model: MiniLM, args: ModelArgs):
@@ -102,7 +111,22 @@ class MiniLMForCausalLM(nn.Module):
 
         if targets is not None:
             if liger_enabled(self.args, h):
-
+                # use_liger + ce_chunk_size>0 = liger's CE kernel with OUR
+                # chunking (models/fused_loss.py): liger's own heuristic
+                # degenerates to 256-row chunks at this vocab/dim ratio.
+                if (
+                    HAS_FUSED_LOSS
+                    and self.args.ce_chunk_size
+                    and self.args.ce_chunk_size > 0
+                ):
+                    loss = flce_large_chunk(
+                        h.reshape(-1, h.size(-1)),
+                        self.output.weight,
+                        targets.reshape(-1),
+                        ignore_index,
+                        self.args.ce_chunk_size,
+                    )
+                    return None, loss
                 loss = liger_flce(
                     h.reshape(-1, h.size(-1)),
                     self.output.weight,
@@ -139,7 +163,9 @@ class MiniLMForCausalLM(nn.Module):
         h_flat = h.reshape(-1, h.size(-1))
         t_flat = targets.reshape(-1)
 
-        def chunk_loss_sum(h_chunk: torch.Tensor, t_chunk: torch.Tensor) -> torch.Tensor:
+        def chunk_loss_sum(
+            h_chunk: torch.Tensor, t_chunk: torch.Tensor
+        ) -> torch.Tensor:
             logits_chunk = F.linear(h_chunk, weight).float()
             return F.cross_entropy(
                 logits_chunk,
@@ -149,9 +175,7 @@ class MiniLMForCausalLM(nn.Module):
             )
 
         total_loss = h_flat.new_zeros((), dtype=torch.float32)
-        for h_chunk, t_chunk in zip(
-            h_flat.split(chunk_size), t_flat.split(chunk_size)
-        ):
+        for h_chunk, t_chunk in zip(h_flat.split(chunk_size), t_flat.split(chunk_size)):
             if self.training:
                 loss_sum = checkpoint(
                     chunk_loss_sum, h_chunk, t_chunk, use_reentrant=False
