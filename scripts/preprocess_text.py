@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 from datasets import load_dataset
+from tokenizers import Tokenizer as TokenizersTokenizer
 from tqdm import tqdm
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -16,11 +17,7 @@ from dataio.tokenizer import Tokenizer
 
 
 class HFTokenizer:
-    """Minimal adapter for HF tokenizers."""
-
     def __init__(self, path: str) -> None:
-        from tokenizers import Tokenizer as TokenizersTokenizer
-
         self._tk = TokenizersTokenizer.from_file(path)
         self.vocab_size = self._tk.get_vocab_size()
         bos = self._tk.token_to_id("<bos>")
@@ -33,7 +30,6 @@ class HFTokenizer:
         text: str,
         bos: bool,
         eos: bool,
-        return_tensors: str = "np",
         dtype=None,
     ) -> np.ndarray:
         ids = self._tk.encode(text, add_special_tokens=False).ids
@@ -114,11 +110,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _split_bucket(i: int, buckets: int) -> int:
-    """splitmix64-style mix: deterministic pseudo-random train/val bucketing.
-
-    A plain `i % buckets` would put a contiguous run of documents from the
-    start of every block into val, biasing it toward corpus ordering.
-    """
     z = (i + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
     z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
     z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF

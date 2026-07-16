@@ -6,7 +6,6 @@ import numpy as np
 
 from dataio.tokenizer import Tokenizer
 
-# Sanity-check this many leading tokens against vocab_size on open.
 _VOCAB_CHECK_TOKENS = 1_000_000
 
 

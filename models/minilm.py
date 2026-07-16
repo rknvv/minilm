@@ -50,8 +50,6 @@ class MiniLM(nn.Module):
         self.register_buffer("rope_cos_local", l_cos, persistent=False)
         self.register_buffer("rope_sin_local", l_sin, persistent=False)
 
-        # Runtime inference mode: only generate() flips this on. Eval-loss
-        # passes stay on the cache-free training path.
         self.use_cache = False
         self._local_mask_cache: dict = {}
         self._flex_block_mask = None
@@ -66,7 +64,6 @@ class MiniLM(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        # RMSNorm weights stay zero-initialized: (1 + 0) is the identity.
 
     def reset_kv_caches(self) -> None:
         for layer in self.layers:
@@ -102,8 +99,6 @@ class MiniLM(nn.Module):
         ), "RoPE cache / KV cache exceeded"
 
         h = self.tok_embeddings(tokens)
-        # Gemma scales embeddings by sqrt(dim); the normalizer is cast to the
-        # activation dtype first (this quantization is part of the trained scale).
         normalizer = torch.tensor(self.args.dim**0.5, dtype=h.dtype)
         h = h * normalizer
 
@@ -126,8 +121,6 @@ class MiniLM(nn.Module):
                 )
                 local_mask = self._get_local_mask(seq_len, h.device)
         else:
-            # FlexAttention does not support dropout; fall back to a dense
-            # boolean mask when attention dropout is active.
             dropout_active = self.training and self.args.dropout > 0.0
             if (
                 HAS_FLEX

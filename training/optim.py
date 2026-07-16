@@ -3,6 +3,7 @@ import math
 from typing import Optional
 
 import torch
+from dion import Muon
 
 from config import TrainConfig
 
@@ -16,11 +17,6 @@ def build_optimizer(
     train_cfg: TrainConfig,
     process_group=None,
 ) -> torch.optim.Optimizer:
-    """process_group: DDP group for dion's distributed Muon — each rank
-    orthogonalizes its share of the hidden-matrix stack and all_gathers the
-    results (identical math, ~1/world_size the Newton-Schulz compute)."""
-    from dion import Muon
-
     hidden_matrix_params = []
     embed_and_head_params = []
     scalar_params = []
@@ -76,7 +72,6 @@ def build_optimizer(
 def build_scheduler(
     optimizer: torch.optim.Optimizer, train_cfg: TrainConfig
 ) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
-    """Linear warmup, then cosine decay to min_lr_ratio * peak (not to 0)."""
     if not train_cfg.decay_lr:
         return None
 

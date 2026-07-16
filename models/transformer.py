@@ -8,7 +8,7 @@ from models.layers import Attention, FeedForward, RMSNorm
 
 
 class TransformerBlock(nn.Module):
-    """Gemma-3 decoder layer with sandwich normalization."""
+    """Gemma-3 decoder layer."""
 
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()

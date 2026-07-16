@@ -16,12 +16,6 @@ TOKEN_DTYPES = {"uint16": np.uint16, "uint32": np.uint32}
 
 
 class SkippableDistributedSampler(DistributedSampler):
-    """DistributedSampler that can skip already-consumed samples after resume.
-
-    `skip_samples` is in per-rank sample units and applies to the current
-    epoch only; the trainer resets it to 0 on epoch rollover.
-    """
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.skip_samples = 0
@@ -33,14 +27,7 @@ class SkippableDistributedSampler(DistributedSampler):
         return iter(indices)
 
 
-def resolve_token_dtype(
-    train_cfg: TrainConfig, model_args: ModelArgs
-) -> np.dtype:
-    """Pick the on-disk token dtype for .bin files.
-
-    Priority: meta.json written by preprocess_text.py (describes the actual
-    file) > explicit train.token_dtype > auto from vocab_size.
-    """
+def resolve_token_dtype(train_cfg: TrainConfig, model_args: ModelArgs) -> np.dtype:
     meta_path = os.path.join(train_cfg.dataset_dir, "meta.json")
     if os.path.exists(meta_path):
         with open(meta_path) as f:
@@ -125,8 +112,6 @@ def build_dataloaders(
     pin_memory = device.startswith("cuda")
     persistent = train_cfg.num_workers > 0
 
-    # Samplers are used even for world_size=1: a seeded DistributedSampler
-    # gives a deterministic per-epoch shuffle that supports skip-on-resume.
     train_sampler = SkippableDistributedSampler(
         train_dataset,
         num_replicas=world_size,
@@ -141,8 +126,6 @@ def build_dataloaders(
         shuffle=False,
     )
 
-    # drop_last keeps batch shapes static (no torch.compile recompiles on the
-    # tail batch).
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg.train_batch_size,

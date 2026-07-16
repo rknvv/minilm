@@ -2,13 +2,8 @@ train:
   task: "pretrain"
   out_dir: "./out_cpt_gemma_1b"
   dataset_dir: "./data/pretrain"
-  # Token dtype of train.bin/val.bin: resolved from meta.json written by
-  # preprocess_text.py, else from vocab_size (184k vocab -> uint32).
   token_dtype: "auto"
 
-  # Start continual pretraining from the pruned Gemma-3-1B (RU+EN, v2) checkpoint:
-  # frequency+merge-closure prune 262144 -> 153856 (601*256, GEMM-aligned).
-  # A .safetensors path triggers the HF Gemma weight loader (see training/checkpoint.py).
   pretrained_checkpoint: "./external/gemma3-1b-base/gemma-3-1b-pt-ruen-v2/model.safetensors"
   resume_from_checkpoint: false
   resume_checkpoint_kind: "latest"
@@ -23,18 +18,11 @@ train:
   wandb_project: "gemma3_1b_cpt_ruen"
   wandb_run_name: "cpt_gemma_1b"
 
-  # B16/a2 (effective batch unchanged): +38% tok/s over B8/a4 on A100, fits in
-  # 68 GiB on the FlexAttention path (SDPA path would OOM). See out_profile/REPORT.md.
   gradient_accumulation_steps: 2
   train_batch_size: 16
-  # Same shape as train: a different eval batch would trigger a trunk
-  # recompile (minutes under max-autotune) on the first eval; B16 no-grad
-  # also evaluates 2x more tokens per iter.
   eval_batch_size: 16
   num_workers: 8
 
-  # AdamW lr (embeddings/head/scalars). Muon hidden matrices run at muon_lr,
-  # conventionally ~10-20x the AdamW lr; tune the ratio on a short run.
   learning_rate: 0.00005
   muon_lr: 0.0005
   max_iters: 100000
@@ -50,12 +38,6 @@ train:
   device: "cuda"
   dtype: "bfloat16"
   compile: true
-  # Tunes the flex-attention backward template (default configs are ~60x slower
-  # than forward on this shape). Profiled on A100: 8.8k -> ~33.9k tok/s with the
-  # full stack; see out_profile/REPORT.md. The models/ diffs this relies on are
-  # validated vs the ORIGINAL gemma-3-1b-pt (verify_gemma PASS, argmax 100%,
-  # eager + compiled trunk); re-run scripts/verify_gemma.py on the pruned v2
-  # checkpoint once it lands (project rule), then launch.
   compile_mode: "max-autotune-no-cudagraphs"
   backend: "nccl"
   eval_only: false
@@ -78,15 +60,6 @@ model:
   sliding_window: 512
   sliding_window_pattern: 6
 
-  # Off: activations fit in 80GB at B=16/T=2048 (peak 72.0 GiB) and full
-  # recompute costs ~25-35% throughput. Flip on if OOM.
   gradient_checkpointing: false
-  # use_liger + ce_chunk_size>0 = VENDORED liger FLCE with our chunking
-  # (models/fused_loss.py): liger's own heuristic degenerates to 256-row
-  # chunks at this vocab (128 tiny GEMMs + 128 grad_weight accumulator passes
-  # per micro-step, ~10% of step). Measured A100: 34.2k tok/s MFU 59.4% vs
-  # 24.6k stock liger; see out_profile/REPORT.md. If OOM on the target box,
-  # drop chunk to 4096 (-1% speed) before anything else. Loss-path parity:
-  # scripts/test_loss_parity_cuda.py (run once per box).
   ce_chunk_size: 8192
   use_liger: true

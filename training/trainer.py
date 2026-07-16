@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.profiler import ProfilerActivity, profile, schedule
 from torch.utils.data import DistributedSampler
 
 from training.checkpoint import normalize_state_dict_keys, validate_state_dict
@@ -32,7 +33,6 @@ _GPU_PEAK_FLOPS = {
 
 
 def _to_cpu(obj: Any) -> Any:
-    """Deep-copy tensors in a (nested) state-dict structure to CPU."""
     if isinstance(obj, torch.Tensor):
         return obj.detach().to("cpu", copy=True)
     if isinstance(obj, dict):
@@ -158,7 +158,6 @@ class Trainer:
             self._log_loss_path()
 
     def _compile_model(self, m: torch.nn.Module) -> torch.nn.Module:
-        """Compile the transformer trunk in place; keep the loss head eager."""
         kwargs: dict[str, Any] = {}
         backend = self.train_cfg.compile_backend
         mode = self.train_cfg.compile_mode
@@ -227,7 +226,6 @@ class Trainer:
         logger.info(f"Loss path: {path}")
 
     def _estimate_flops_per_token(self) -> float:
-        """Model FLOPs per token (fwd+bwd), causal attention accounted."""
         m = self.model_cfg
         d, L, H = m.dim, m.n_layers, m.n_heads
         hd = m.head_dim
@@ -264,7 +262,6 @@ class Trainer:
     def _build_profiler(self):
         if not self.train_cfg.profile:
             return None
-        from torch.profiler import ProfilerActivity, profile, schedule
 
         cuda = self.device.startswith("cuda")
         activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])

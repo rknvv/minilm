@@ -1,6 +1,7 @@
 import logging
 import os
 from collections.abc import Mapping
+from safetensors.torch import load_file
 
 import torch
 
@@ -50,7 +51,9 @@ def validate_state_dict(
     validated: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         if not isinstance(key, str) or not isinstance(value, torch.Tensor):
-            raise TypeError("Model state_dict must map str keys to torch.Tensor values.")
+            raise TypeError(
+                "Model state_dict must map str keys to torch.Tensor values."
+            )
         validated[key] = value
     return validated
 
@@ -71,7 +74,9 @@ def normalize_state_dict_keys(
 
 def load_pretrained_weights(model: torch.nn.Module, checkpoint_path: str) -> None:
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Pretrained checkpoint not found at: {checkpoint_path}")
+        raise FileNotFoundError(
+            f"Pretrained checkpoint not found at: {checkpoint_path}"
+        )
 
     if checkpoint_path.endswith(".safetensors"):
         load_gemma_hf_weights(model, checkpoint_path)
@@ -83,9 +88,13 @@ def load_pretrained_weights(model: torch.nn.Module, checkpoint_path: str) -> Non
     result = model.load_state_dict(state_dict, strict=False)
 
     if result.missing_keys:
-        logger.warning(f"Missing keys while loading pretrained weights: {result.missing_keys}")
+        logger.warning(
+            f"Missing keys while loading pretrained weights: {result.missing_keys}"
+        )
     if result.unexpected_keys:
-        logger.warning(f"Unexpected keys while loading pretrained weights: {result.unexpected_keys}")
+        logger.warning(
+            f"Unexpected keys while loading pretrained weights: {result.unexpected_keys}"
+        )
 
 
 def _convert_gemma_hf_state_dict(
@@ -122,14 +131,6 @@ def _convert_gemma_hf_state_dict(
 
 
 def load_gemma_hf_weights(model: torch.nn.Module, safetensors_path: str) -> None:
-    """Load HF Gemma-3 safetensors weights into a MiniLMForCausalLM for CPT.
-
-    Expects ``model`` to expose ``.model`` (inner MiniLM), ``.output`` (tied head),
-    and ``.args`` (ModelArgs). Embeddings are tied, so there is no ``lm_head`` in
-    the file; the output head is re-pointed at the embedding weight after loading.
-    """
-    from safetensors.torch import load_file
-
     if not os.path.exists(safetensors_path):
         raise FileNotFoundError(f"Safetensors file not found: {safetensors_path}")
 
@@ -145,8 +146,9 @@ def load_gemma_hf_weights(model: torch.nn.Module, safetensors_path: str) -> None
             f"Unexpected keys when loading Gemma weights: {result.unexpected_keys}"
         )
     if result.missing_keys:
-        logger.warning(f"Missing keys while loading Gemma weights: {result.missing_keys}")
+        logger.warning(
+            f"Missing keys while loading Gemma weights: {result.missing_keys}"
+        )
 
-    # Re-establish weight tying (load_state_dict may have replaced the tensor).
     model.output.weight = inner.tok_embeddings.weight  # type: ignore[attr-defined]
     logger.info("Gemma HF weights loaded and output head re-tied to embeddings.")

@@ -1,15 +1,3 @@
-"""Liger fused-linear-cross-entropy with an explicit (large) chunk size.
-Liger's internal heuristic picks
-``chunk_size = next_pow2(BT / ceil(V/H))``; at V=153856, H=1152 that is 256
-rows -> 128 chunks per micro-step, i.e. 128 tiny GEMMs and 128
-read-modify-write passes over the [V, H] grad_weight accumulator (~10% of
-step time, measured on A100). With an explicit chunk size (e.g. 4096) the
-same Triton CE kernel runs over a few large chunks: big GEMMs, few
-accumulator passes, and - unlike the checkpointed chunked-CE fallback in
-lm_head - no forward recompute in backward, because grads are produced
-during the forward pass (efficient_cross_entropy style).
-"""
-
 import torch
 import triton
 
@@ -40,22 +28,16 @@ def _flce_forward(_input, weight, target, ignore_index, chunk_size):
     )
     loss_1d = torch.zeros(BT, dtype=torch.float32, device=_input.device)
 
-    # Scalar kernel argument for mean reduction (host sync; hidden by queue
-    # depth at current step times - revisit if the step ever gets CPU-bound).
     total_n_non_ignore = int((target != ignore_index).sum().item())
 
     for chunk_id in range(num_chunks):
         start = chunk_id * chunk_size
         end = min(start + chunk_size, BT)
         input_chunk = _input[start:end]  # [rows, H]
-        # Matmul in the ambient autocast dtype, exactly like stock liger.
         logits_chunk = (input_chunk @ weight.t()).contiguous()  # [rows, V]
         target_chunk = target[start:end].contiguous()
         loss_slice = loss_1d[start:end]
 
-        # Computes per-row loss and, when HAS_GRADIENTS, overwrites
-        # logits_chunk in place with d(loss)/d(logits) (pre-scaled by
-        # 1/n_non_ignore for reduction="mean").
         liger_cross_entropy_kernel[(end - start,)](
             X_ptr=logits_chunk,
             X_stride=logits_chunk.stride(-2),

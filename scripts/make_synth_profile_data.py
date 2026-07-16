@@ -1,5 +1,3 @@
-"""Generate synthetic random-token memmap data for SPEED profiling only."""
-
 import argparse
 import json
 import os

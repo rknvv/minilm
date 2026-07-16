@@ -31,7 +31,6 @@ class MiniLMForCausalLM(nn.Module):
 
         self.output.weight = self.model.tok_embeddings.weight
 
-        # Generation defaults (overridden by from_pretrained from config.json).
         self.bos_token_id: Optional[int] = None
         self.eos_token_id: Optional[int] = None
         self.pad_token_id: Optional[int] = None
@@ -44,17 +43,7 @@ class MiniLMForCausalLM(nn.Module):
         device: Optional[torch.device | str] = None,
         **model_overrides,
     ) -> "MiniLMForCausalLM":
-        """Build the model from a HF Gemma3 checkpoint and load its weights.
-
-        Args:
-            model_path: directory with config.json + model.safetensors, or a
-                path to the .safetensors file (config.json must sit next to it).
-            dtype: cast model to this dtype before loading (RoPE buffers are kept
-                in float32 regardless, matching HF).
-            device: move the model to this device after loading.
-            **model_overrides: forwarded to ModelArgs.from_hf (e.g.
-                max_seq_len=2048, gradient_checkpointing=True, use_liger=True).
-        """
+        """Build the model from a HF Gemma3 checkpoint and load its weights."""
         import json
         import os
 
@@ -83,7 +72,6 @@ class MiniLMForCausalLM(nn.Module):
 
         if dtype is not None:
             model = model.to(dtype)
-            # Keep RoPE caches in float32 for rotation precision (HF does too).
             inner = model.model
             for name in (
                 "rope_cos_global",
@@ -111,9 +99,6 @@ class MiniLMForCausalLM(nn.Module):
 
         if targets is not None:
             if liger_enabled(self.args, h):
-                # use_liger + ce_chunk_size>0 = liger's CE kernel with OUR
-                # chunking (models/fused_loss.py): liger's own heuristic
-                # degenerates to 256-row chunks at this vocab/dim ratio.
                 if (
                     HAS_FUSED_LOSS
                     and self.args.ce_chunk_size

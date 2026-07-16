@@ -35,15 +35,6 @@ _flex_attention_compiled = None
 
 
 def _flex_sdpa(q, k, v, block_mask, scale: float, enable_gqa: bool):
-    """flex_attention is only fast when compiled.
-
-    Under an outer torch.compile trace (the trainer compiles the trunk), call
-    it directly: the outer graph captures the flex HOP natively, instead of
-    graph-breaking on a nested torch.compile wrapper. In pure eager, fall back
-    to a lazily-compiled wrapper. Validated vs original gemma-3-1b-pt on both
-    paths (verify_gemma.py PASS, argmax 100%); re-run against the pruned v2
-    checkpoint when it lands (project rule for models/ diffs).
-    """
     if torch.compiler.is_compiling():
         return flex_attention(
             q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
@@ -81,10 +72,7 @@ def liger_enabled(args: ModelArgs, x: torch.Tensor) -> bool:
 
 
 class RMSNorm(nn.Module):
-    """Gemma-style RMSNorm: output = normed(x) * (1 + weight), computed in float32.
-
-    The weight is zero-initialized so an untrained norm is the identity.
-    """
+    """Gemma-style RMSNorm: output = normed(x) * (1 + weight), computed in float32."""
 
     def __init__(self, dim: int, norm_eps: float = 1e-6):
         super().__init__()
@@ -162,13 +150,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 def build_local_bool_mask(
     seq_len: int, window: int, device: torch.device
 ) -> torch.Tensor:
-    """Boolean [seq, seq] keep-mask for local layers: causal + sliding window.
-
-    Position i attends to [max(0, i - window + 1), i]. Boolean masks are
-    dtype-agnostic: SDPA converts them to an additive bias in the query dtype,
-    so autocast/bf16/fp32 paths all stay consistent. Global layers never need
-    a mask (is_causal=True covers them).
-    """
     idx = torch.arange(seq_len, device=device)
     causal = idx[None, :] <= idx[:, None]
     return causal & (idx[None, :] > (idx[:, None] - window))
@@ -254,7 +235,6 @@ class Attention(nn.Module):
         xk = self.wk(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
         xv = self.wv(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
-        # QK-norm (per head, float32) before RoPE.
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
 
@@ -269,9 +249,6 @@ class Attention(nn.Module):
             self.v_cache[:batch_size, start_pos : start_pos + seq_len] = xv
 
             end = start_pos + seq_len
-            # Incremental decode (seq_len == 1): bound local layers to the
-            # last `sliding_window` keys. Prefill attends to the full range;
-            # the local_mask / is_causal enforce window and causality there.
             if seq_len == 1 and (not self.is_global) and end > self.sliding_window:
                 lo = end - self.sliding_window
             else:
@@ -281,8 +258,6 @@ class Attention(nn.Module):
         else:
             keys, values = xk, xv
 
-        # GQA: SDPA/flex broadcast KV heads natively on cuda/cpu; only exotic
-        # backends need materialized repeat_kv.
         use_gqa = self.n_rep > 1 and x.device.type in ("cuda", "cpu")
         if self.n_rep > 1 and not use_gqa:
             keys = repeat_kv(keys, self.n_rep)
@@ -295,16 +270,11 @@ class Attention(nn.Module):
         dropout_p = self.args.dropout if self.training else 0.0
 
         if (not use_cache) and (not self.is_global) and local_block_mask is not None:
-            # Local layer fast path: FlexAttention with a block-sparse
-            # sliding-window mask (real FLOP savings vs a dense [T, T] mask).
             attn_output = _flex_sdpa(
                 xq, keys, values, local_block_mask, self.scale, self.n_rep > 1
             )
         else:
             if self.is_global:
-                # Causal global attention. Prefill writes the cache from
-                # position 0, so q_len == kv_len and is_causal is exact;
-                # decode steps (seq_len == 1) attend to the whole cache.
                 attn_mask = None
                 is_causal = seq_len > 1
             else:
