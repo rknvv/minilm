@@ -1,8 +1,8 @@
 # MiniLM
 
-Рукописная реализация Gemma-3-1B на PyTorch для continued pretraining (CPT) на русском+английском с pruned-словарём (262k → 154k: frequency+merge-closure прунинг, размер кратен 256 под tensor-core GEMM). Цель проекта — пощупать претрейн руками и выжать максимум скорости из 2×H100.
+Рукописная реализация Gemma-3-1B на PyTorch для continued pretraining на русском + английском с пруненым-словарём 262k -> 154k. Цель проекта — выжать максимум скорости из H100.
 
-Архитектура (Gemma-3): RMSNorm-сэндвич, QK-norm, RoPE (global 1M / local 10k), GeGLU MLP, GQA, чередование sliding-window (512) и global attention 5:1, weight tying. Совпадение логитов с HF `Gemma3ForCausalLM` проверяется скриптом `scripts/verify_gemma.py`.
+Архитектура (Gemma-3): RMSNorm-сэндвич, QK-norm, RoPE (global 1M / local 10k), GeGLU MLP, GQA, чередование sliding-window (512) и global attention 5:1, weight tying.
 
 ## Архитектура
 
@@ -19,8 +19,8 @@
 
 ## Оптимизации
 
-- **FlexAttention** на local-слоях (block-sparse sliding window), `is_causal` flash-путь на global-слоях, `enable_gqa` без материализации KV-голов
-- **Liger fused linear cross-entropy** (логиты 184k-словаря не материализуются); fallback — chunked CE
-- **Muon (dion)** для скрытых матриц + AdamW для embeddings/head/скаляров, раздельные lr
-- `torch.compile` поверх DDP (DDPOptimizer оверлапит allreduce с backward), bf16 autocast
-- Метрики в логах/wandb: tokens/s, ms/step, MFU, peak memory
+- **FlexAttention**
+- **Liger fused linear cross-entropy**
+- **Muon (dion)**
+- `torch.compile`
+- Метрики в логах/wandb: ток/s, ms/step, MFU
