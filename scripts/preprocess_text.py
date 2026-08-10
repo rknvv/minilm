@@ -13,8 +13,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from dataio.tokenizer import Tokenizer
-
 
 class HFTokenizer:
     def __init__(self, path: str) -> None:
@@ -40,10 +38,13 @@ class HFTokenizer:
         return np.asarray(ids, dtype=dtype if dtype is not None else np.int64)
 
 
-def load_tokenizer(path: str):
-    if path.endswith(".json"):
-        return HFTokenizer(path)
-    return Tokenizer(model_file=path)
+def load_tokenizer(path: str) -> HFTokenizer:
+    if not path.endswith(".json"):
+        raise ValueError(
+            f"Expected a HF tokenizer.json, got {path!r}. The CPT vocabulary ships "
+            "with the pruned Gemma-3 checkpoint (external/.../tokenizer.json)."
+        )
+    return HFTokenizer(path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,18 +55,13 @@ def parse_args() -> argparse.Namespace:
         "--tokenizer_path",
         required=True,
         type=str,
-        help="Path to a SentencePiece model or HF tokenizer.json.",
+        help="Path to the HF tokenizer.json shipped with the pruned Gemma-3 checkpoint.",
     )
     parser.add_argument(
         "--dataset_files",
         nargs="+",
+        required=True,
         help="One or more input text files for datasets.load_dataset(..., data_files=...).",
-    )
-    parser.add_argument(
-        "--dataset_dir",
-        nargs="+",
-        default=None,
-        help="Backward-compatible alias of --dataset_files.",
     )
     parser.add_argument(
         "--output_path",
@@ -103,10 +99,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Append EOS to each document.",
     )
-    args = parser.parse_args()
-    if not args.dataset_files and not args.dataset_dir:
-        parser.error("one of --dataset_files or --dataset_dir is required")
-    return args
+    return parser.parse_args()
 
 
 def _split_bucket(i: int, buckets: int) -> int:
@@ -130,7 +123,7 @@ def resolve_token_dtype(token_dtype: str, vocab_size: int) -> np.dtype:
 
 
 def tokenize_corpus(
-    tokenizer: Tokenizer | HFTokenizer,
+    tokenizer: HFTokenizer,
     dataset_files: list[str],
     output_path: str,
     val_ratio: float,
@@ -160,16 +153,9 @@ def tokenize_corpus(
     dataset = load_dataset("text", data_files=data_files, streaming=True)
 
     def tokenize(item: dict[str, Any]) -> dict[str, np.ndarray]:
-        token_ids = tokenizer(
-            item["text"],
-            bos=add_bos,
-            eos=add_eos,
-            return_tensors="np",
-            dtype=dtype,
-        )
-        if isinstance(token_ids, np.ndarray):
-            return {"ids": token_ids.reshape(-1)}
-        return {"ids": np.asarray(token_ids, dtype=dtype)}
+        return {
+            "ids": tokenizer(item["text"], bos=add_bos, eos=add_eos, dtype=dtype)
+        }
 
     tokenized_data = dataset.map(tokenize, remove_columns="text")
 
@@ -221,10 +207,9 @@ def tokenize_corpus(
 def main() -> None:
     args = parse_args()
     tokenizer = load_tokenizer(args.tokenizer_path)
-    dataset_files = args.dataset_files or args.dataset_dir
     tokenize_corpus(
         tokenizer=tokenizer,
-        dataset_files=dataset_files,
+        dataset_files=args.dataset_files,
         output_path=args.output_path,
         val_ratio=args.val_ratio,
         split_buckets=args.split_buckets,
