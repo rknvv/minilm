@@ -300,7 +300,7 @@ class Trainer:
             outputs = self.model(
                 inputs,
                 targets=targets,
-                ignore_index=self.train_cfg.sft_ignore_idx,
+                ignore_index=self.train_cfg.ignore_index,
             )
             if not isinstance(outputs, tuple) or len(outputs) != 2:
                 raise RuntimeError("Model forward must return (logits, loss).")
@@ -422,14 +422,7 @@ class Trainer:
         while self.global_step < self.train_cfg.max_iters:
             train_batch = self._next_train_batch()
 
-            if self.train_cfg.task == "sft":
-                batch_tokens = int(
-                    (train_batch["labels"] != self.train_cfg.sft_ignore_idx)
-                    .sum()
-                    .item()
-                )
-            else:
-                batch_tokens = int(train_batch["input_ids"].numel())
+            batch_tokens = int(train_batch["input_ids"].numel())
             self.tokens_seen += batch_tokens * self.ddp_world_size
             tokens_since_log += batch_tokens * self.ddp_world_size
 
@@ -599,7 +592,7 @@ class Trainer:
                     outputs = self.model(
                         inputs,
                         targets=targets,
-                        ignore_index=self.train_cfg.sft_ignore_idx,
+                        ignore_index=self.train_cfg.ignore_index,
                     )
                     if not isinstance(outputs, tuple) or len(outputs) != 2:
                         raise RuntimeError("Model forward must return (logits, loss).")

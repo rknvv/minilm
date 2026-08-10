@@ -8,7 +8,6 @@ numpy==1.26.3
 transformers==5.9.0
 tokenizers==0.22.2
 safetensors==0.7.0
-sentencepiece==0.2.1
 pydantic==2.13.4
 fire==0.7.1
 tqdm==4.67.3

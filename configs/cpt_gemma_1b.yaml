@@ -1,5 +1,4 @@
 train:
-  task: "pretrain"
   out_dir: "./out_cpt_gemma_1b"
   dataset_dir: "./data/pretrain"
   token_dtype: "auto"
@@ -63,3 +62,4 @@ model:
   gradient_checkpointing: false
   ce_chunk_size: 8192
   use_liger: true
+  use_flex_attention: true

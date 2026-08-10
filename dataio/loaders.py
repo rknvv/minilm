@@ -1,14 +1,13 @@
 import json
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
-import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from config import ModelArgs, TrainConfig
-from dataio.dataset import MemmapDataset, SFTDataset
+from dataio.dataset import MemmapDataset
 
 logger = logging.getLogger(__name__)
 
@@ -58,47 +57,21 @@ def resolve_token_dtype(train_cfg: TrainConfig, model_args: ModelArgs) -> np.dty
 def build_datasets(
     train_cfg: TrainConfig, model_args: ModelArgs
 ) -> Tuple[Dataset, Dataset]:
-    task = str(train_cfg.task).lower()
-
-    if task == "pretrain":
-        token_dtype = resolve_token_dtype(train_cfg, model_args)
-        logger.info(f"Memmap token dtype: {token_dtype.name}")
-        train_dataset = MemmapDataset(
-            os.path.join(train_cfg.dataset_dir, "train.bin"),
-            sequence_length=model_args.max_seq_len,
-            memmap_dtype=token_dtype,
-            vocab_size=model_args.vocab_size,
-        )
-        eval_dataset = MemmapDataset(
-            os.path.join(train_cfg.dataset_dir, "val.bin"),
-            sequence_length=model_args.max_seq_len,
-            memmap_dtype=token_dtype,
-            vocab_size=model_args.vocab_size,
-        )
-        return train_dataset, eval_dataset
-
-    if task == "sft":
-        if not train_cfg.train_data_path:
-            raise ValueError("For task='sft', train_data_path is required.")
-        if not train_cfg.tokenizer_path:
-            raise ValueError("For task='sft', tokenizer_path is required.")
-
-        eval_path = train_cfg.eval_data_path or train_cfg.train_data_path
-        train_dataset = SFTDataset(
-            data_path=train_cfg.train_data_path,
-            tokenizer_path=train_cfg.tokenizer_path,
-            max_seq_len=model_args.max_seq_len,
-            ignore_idx=train_cfg.sft_ignore_idx,
-        )
-        eval_dataset = SFTDataset(
-            data_path=eval_path,
-            tokenizer_path=train_cfg.tokenizer_path,
-            max_seq_len=model_args.max_seq_len,
-            ignore_idx=train_cfg.sft_ignore_idx,
-        )
-        return train_dataset, eval_dataset
-
-    raise ValueError("train.task must be one of: 'pretrain', 'sft'.")
+    token_dtype = resolve_token_dtype(train_cfg, model_args)
+    logger.info(f"Memmap token dtype: {token_dtype.name}")
+    train_dataset = MemmapDataset(
+        os.path.join(train_cfg.dataset_dir, "train.bin"),
+        sequence_length=model_args.max_seq_len,
+        memmap_dtype=token_dtype,
+        vocab_size=model_args.vocab_size,
+    )
+    eval_dataset = MemmapDataset(
+        os.path.join(train_cfg.dataset_dir, "val.bin"),
+        sequence_length=model_args.max_seq_len,
+        memmap_dtype=token_dtype,
+        vocab_size=model_args.vocab_size,
+    )
+    return train_dataset, eval_dataset
 
 
 def build_dataloaders(

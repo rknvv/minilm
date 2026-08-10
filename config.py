@@ -14,7 +14,7 @@ class ModelArgs(BaseModel):
     n_heads: int = 4
     n_kv_heads: Optional[int] = 1
     head_dim: int = 256
-    vocab_size: int = 183927
+    vocab_size: int = 153856  # pruned Gemma-3 vocab, 601 x 256
     intermediate_size: int = 6912
     norm_eps: float = 1e-6
     max_seq_len: int = 2048
@@ -29,9 +29,9 @@ class ModelArgs(BaseModel):
 
     gradient_checkpointing: bool = False
 
-    ce_chunk_size: int = Field(default=0, ge=0)
+    ce_chunk_size: int = Field(default=8192, ge=0)
 
-    use_liger: bool = False
+    use_liger: bool = True
     use_flex_attention: bool = True
 
     @model_validator(mode="after")
@@ -67,15 +67,10 @@ class ModelArgs(BaseModel):
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    task: Literal["pretrain", "sft"] = "pretrain"
-
     out_dir: str = "out"
     dataset_dir: str = "./data/pretrain"
-    train_data_path: Optional[str] = None
-    eval_data_path: Optional[str] = None
-    tokenizer_path: Optional[str] = None
     pretrained_checkpoint: Optional[str] = None
-    sft_ignore_idx: int = -100
+    ignore_index: int = -100
 
     resume_from_checkpoint: bool = True
     resume_checkpoint_kind: Literal["latest", "best", "auto"] = "latest"
@@ -83,12 +78,12 @@ class TrainConfig(BaseModel):
     seed: int = 42
     token_dtype: Literal["auto", "uint16", "uint32"] = "auto"
 
-    eval_interval: int = Field(default=10, ge=1)
-    log_interval: int = Field(default=1, ge=1)
-    eval_iters: int = Field(default=1, ge=1)
+    eval_interval: int = Field(default=1000, ge=1)
+    log_interval: int = Field(default=20, ge=1)
+    eval_iters: int = Field(default=100, ge=1)
     always_save_checkpoint: bool = True
     wandb_log: bool = False
-    wandb_project: str = "minilm-pretrain"
+    wandb_project: str = "gemma3_1b_cpt_ruen"
     wandb_run_name: str = "run"
 
     gradient_accumulation_steps: int = Field(default=1, ge=1)
@@ -97,11 +92,11 @@ class TrainConfig(BaseModel):
 
     num_workers: int = Field(default=4, ge=0)
 
-    learning_rate: float = 6e-4
-    muon_lr: Optional[float] = None
+    learning_rate: float = 5e-5
+    muon_lr: Optional[float] = 5e-4
     muon_use_triton: bool = False
     muon_distributed: bool = True
-    max_iters: int = Field(default=600000, ge=1)
+    max_iters: int = Field(default=100000, ge=1)
     weight_decay: float = 1e-1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -132,8 +127,6 @@ class TrainConfig(BaseModel):
             raise ValueError(
                 f"warmup_iters ({self.warmup_iters}) cannot exceed max_iters ({self.max_iters})"
             )
-        if self.task == "sft" and not self.train_data_path:
-            raise ValueError("task='sft' requires train_data_path")
         if self.ema is not None and not (0.0 < self.ema < 1.0):
             raise ValueError(f"ema decay must be in (0, 1), got {self.ema}")
         if self.muon_lr is not None and self.muon_lr <= 0:

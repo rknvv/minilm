@@ -37,13 +37,20 @@ def _sibling_config(ckpt_path: str, config_path: Optional[str]) -> str:
         )
     return candidate
 
+def _train_config_from_snapshot(section: dict) -> TrainConfig:
+    known = {k: v for k, v in section.items() if k in TrainConfig.model_fields}
+    dropped = sorted(set(section) - set(known))
+    if dropped:
+        logger.warning("Ignoring retired config keys from snapshot: %s", dropped)
+    return TrainConfig(**known)
+
 def load_model(
     ckpt_path: str, config_path: Optional[str] = None, device: Optional[str] = None
 ) -> Tuple[MiniLMForCausalLM, ModelArgs, TrainConfig]:
 
     cfg = yaml.safe_load(open(_sibling_config(ckpt_path, config_path)))
     model_args = ModelArgs(**cfg["model"])
-    train_cfg = TrainConfig(**cfg["train"])
+    train_cfg = _train_config_from_snapshot(cfg["train"])
 
     model = MiniLMForCausalLM(MiniLM(model_args), model_args)
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -88,7 +95,7 @@ def perplexity(
             break
         inputs = batch["input_ids"].to(dev)
         targets = batch["labels"].to(dev)
-        _, loss = model(inputs, targets=targets)
+        _, loss = model(inputs, targets=targets, ignore_index=train_cfg.ignore_index)
         total_loss += float(loss)
         n_batches += 1
 
