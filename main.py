@@ -26,6 +26,7 @@ SNAPSHOT_CODE_MODULES = [
     "models.transformer",
     "models.minilm",
     "models.lm_head",
+    "models.fused_loss",
     "config",
 ]
 
